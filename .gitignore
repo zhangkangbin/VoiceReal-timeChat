@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.idea/
+.tools/
+android-*.png
+android/.gradle/
+android/build/
+android/app/build/
+android/app/libs/ort.zip
+android/app/libs/ortclasses.jar
+android/app/libs/ortx/
