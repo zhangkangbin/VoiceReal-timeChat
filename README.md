@@ -23,7 +23,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 后续可以直接执行 `.\start_local.ps1`，自动启动 LM Studio 本地 API、加载模型并启动 FastAPI。
 
-先在 LM Studio 中启动 Local Server，并加载 `qwen2.5-coder-14b-instruct`。服务端默认读取 `AI_PROVIDER=lmstudio`，不会调用云端 API。语音识别默认使用已验证可用的 `tiny`；下载完整 `small` 权重后可改为 `small` 提高准确率。
+先在 LM Studio 中启动 Local Server，并加载 `google/gemma-2-27b`。服务端默认读取 `AI_PROVIDER=lmstudio`，不会调用云端 API。语音识别默认使用已验证可用的 `tiny`；下载完整 `small` 权重后可改为 `small` 提高准确率。
 
 ## Android
 

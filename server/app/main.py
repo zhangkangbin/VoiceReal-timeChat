@@ -29,7 +29,7 @@ def provider_name() -> str:
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "qwen2.5-coder-14b-instruct"), "whisper_model": WHISPER_MODEL}
+    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-2-27b"), "whisper_model": WHISPER_MODEL}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -97,7 +97,7 @@ def transcribe_pcm(pcm: bytes) -> str:
 
 async def ask_lmstudio(text: str) -> str:
     url = os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1").rstrip("/") + "/chat/completions"
-    payload = {"model": os.getenv("LMSTUDIO_MODEL", "qwen2.5-coder-14b-instruct"), "messages": [
+    payload = {"model": os.getenv("LMSTUDIO_MODEL", "google/gemma-2-27b"), "messages": [
         {"role": "system", "content": "你是一个自然、简洁、友好的中文语音助手。回答适合直接朗读，不要使用 Markdown。"},
         {"role": "user", "content": text}], "stream": False, "temperature": 0.3, "max_tokens": 128}
     async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
