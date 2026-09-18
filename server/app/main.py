@@ -17,8 +17,9 @@ from fastapi.responses import HTMLResponse
 
 load_dotenv()
 app = FastAPI(title="Local Realtime Voice Chat Server", version="0.2.0")
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "tiny")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
+WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
 _whisper = None
 _stt_lock = asyncio.Lock()
 
@@ -29,7 +30,7 @@ def provider_name() -> str:
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-2-27b"), "whisper_model": WHISPER_MODEL}
+    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-2-27b"), "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -81,7 +82,16 @@ def transcribe_pcm(pcm: bytes) -> str:
         def run_transcription(model):
             # Android already performs client-side VAD. Skipping a second VAD
             # pass reduces the time from commit to transcript.
-            segments, _ = model.transcribe(path, language="zh", beam_size=1, vad_filter=False)
+            segments, _ = model.transcribe(
+                path,
+                language="zh",
+                task="transcribe",
+                beam_size=WHISPER_BEAM_SIZE,
+                temperature=0.0,
+                condition_on_previous_text=False,
+                initial_prompt="以下是普通话语音转写，使用简体中文和自然标点。",
+                vad_filter=False,
+            )
             return "".join(segment.text for segment in segments).strip()
         try:
             return run_transcription(_whisper)
