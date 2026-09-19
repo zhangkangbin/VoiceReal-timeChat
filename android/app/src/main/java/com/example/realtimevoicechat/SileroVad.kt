@@ -14,6 +14,7 @@ class SileroVad(context: Context) : AutoCloseable {
         data class SpeechStarted(val frames: List<ByteArray>) : Decision
         data class SpeechFrame(val frame: ByteArray) : Decision
         data object SpeechEnded : Decision
+        data object SpeechDiscarded : Decision
         data object Silence : Decision
     }
 
@@ -29,11 +30,13 @@ class SileroVad(context: Context) : AutoCloseable {
 
     init {
         val model = context.assets.open("silero_vad.onnx").use { it.readBytes() }
-        val options = OrtSession.SessionOptions().apply {
-            setIntraOpNumThreads(1)
-            setInterOpNumThreads(1)
+        session = OrtSession.SessionOptions().use { options ->
+            options.apply {
+                setIntraOpNumThreads(1)
+                setInterOpNumThreads(1)
+            }
+            environment.createSession(model, options)
         }
-        session = environment.createSession(model, options)
     }
 
     fun accept(frame: ByteArray): Decision {
@@ -48,13 +51,12 @@ class SileroVad(context: Context) : AutoCloseable {
                 speaking = true
                 pendingSpeech = 0
                 silenceFrames = 0
-                speechFrames = 0
+                speechFrames = SPEECH_START_FRAMES
                 return Decision.SpeechStarted(preRoll.toList())
             }
             return Decision.Silence
         }
 
-        speechFrames++
         if (probability < SILENCE_THRESHOLD) {
             silenceFrames++
             if (silenceFrames >= SILENCE_END_FRAMES) {
@@ -63,9 +65,10 @@ class SileroVad(context: Context) : AutoCloseable {
                 val validSpeech = speechFrames >= MIN_SPEECH_FRAMES
                 speechFrames = 0
                 preRoll.clear()
-                return if (validSpeech) Decision.SpeechEnded else Decision.Silence
+                return if (validSpeech) Decision.SpeechEnded else Decision.SpeechDiscarded
             }
         } else {
+            speechFrames++
             silenceFrames = 0
         }
         return Decision.SpeechFrame(frame)
@@ -92,30 +95,24 @@ class SileroVad(context: Context) : AutoCloseable {
             sourceIndex += 2
         }
 
-        val inputTensor = OnnxTensor.createTensor(
-            environment,
-            FloatBuffer.wrap(input),
-            longArrayOf(1, input.size.toLong())
-        )
-        val stateTensor = OnnxTensor.createTensor(
-            environment,
-            FloatBuffer.wrap(state),
-            longArrayOf(2, 1, 128)
-        )
-        val sampleRateTensor = OnnxTensor.createTensor(
-            environment,
-            LongBuffer.wrap(longArrayOf(SAMPLE_RATE.toLong())),
-            longArrayOf()
-        )
-        session.run(
-            mapOf("input" to inputTensor, "state" to stateTensor, "sr" to sampleRateTensor)
-        ).use { result ->
-            val output = (result[0].value as Array<FloatArray>)[0][0]
-            val nextState = result[1] as OnnxTensor
-            nextState.floatBuffer.rewind()
-            nextState.floatBuffer.get(state)
-            audioContext = input.copyOfRange(FRAME_SAMPLES, input.size)
-            return output
+        // Full duplex keeps this path running continuously; close every native
+        // tensor per frame instead of leaking ONNX buffers during long calls.
+        OnnxTensor.createTensor(environment, FloatBuffer.wrap(input),
+            longArrayOf(1, input.size.toLong())).use { inputTensor ->
+            OnnxTensor.createTensor(environment, FloatBuffer.wrap(state),
+                longArrayOf(2, 1, 128)).use { stateTensor ->
+                OnnxTensor.createTensor(environment, LongBuffer.wrap(longArrayOf(SAMPLE_RATE.toLong())),
+                    longArrayOf()).use { sampleRateTensor ->
+                    session.run(mapOf("input" to inputTensor, "state" to stateTensor, "sr" to sampleRateTensor)).use { result ->
+                        val output = (result[0] as OnnxTensor).floatBuffer.get(0)
+                        val nextState = (result[1] as OnnxTensor).floatBuffer
+                        nextState.rewind()
+                        nextState.get(state)
+                        audioContext = input.copyOfRange(FRAME_SAMPLES, input.size)
+                        return output
+                    }
+                }
+            }
         }
     }
 
@@ -130,7 +127,7 @@ class SileroVad(context: Context) : AutoCloseable {
         private const val PRE_ROLL_FRAMES = 6 // 192 ms
         private const val SPEECH_START_FRAMES = 3 // 96 ms
         private const val SILENCE_END_FRAMES = 12 // 384 ms
-        private const val MIN_SPEECH_FRAMES = 8 // 256 ms after start
+        private const val MIN_SPEECH_FRAMES = 8 // 256 ms voiced, excluding trailing silence
         private const val SPEECH_THRESHOLD = 0.65f
         private const val SILENCE_THRESHOLD = 0.35f
     }

@@ -7,6 +7,7 @@ import subprocess
 import time
 import tempfile
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 
 import httpx
@@ -21,7 +22,9 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
 _whisper = None
-_stt_lock = asyncio.Lock()
+# Cancelling an asyncio task cannot stop a running CTranslate2 call. Keep
+# serialization in the worker, so a cancelled job never overlaps the next one.
+_stt_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="local-stt")
 
 
 def provider_name() -> str:
@@ -98,6 +101,7 @@ def transcribe_pcm(pcm: bytes) -> str:
         except Exception:
             if WHISPER_DEVICE != "cuda":
                 raise
+            from faster_whisper import WhisperModel
             _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
             return run_transcription(_whisper)
     finally:
@@ -134,28 +138,38 @@ def synthesize_sapi(text: str) -> bytes:
         return frames
 
 
-async def local_turn(websocket: WebSocket, pcm: bytes, turn_id: str):
+async def send_event(websocket: WebSocket, send_lock: asyncio.Lock, payload: dict):
+    async with send_lock:
+        await websocket.send_json(payload)
+
+
+async def local_turn(websocket: WebSocket, send_lock: asyncio.Lock, pcm: bytes, turn_id: str):
     started = time.perf_counter()
     print(f"local turn start: {len(pcm)} bytes", flush=True)
     try:
         # faster-whisper/CTranslate2 should not receive concurrent GPU jobs
         # from multiple WebSocket clients on this local service.
-        async with _stt_lock:
-            text = await asyncio.to_thread(transcribe_pcm, pcm)
+        text = await asyncio.get_running_loop().run_in_executor(_stt_executor, transcribe_pcm, pcm)
         print(f"local turn transcript: {text!r} ({time.perf_counter() - started:.2f}s)", flush=True)
-        await websocket.send_json({"type": "conversation.transcript", "turn_id": turn_id, "text": text, "final": True})
+        await send_event(websocket, send_lock, {"type": "conversation.transcript", "turn_id": turn_id, "text": text, "final": True})
         if not text:
-            await websocket.send_json({"type": "response.audio.done", "turn_id": turn_id})
+            await send_event(websocket, send_lock, {"type": "response.audio.done", "turn_id": turn_id})
             return
         reply = await ask_lmstudio(text)
         print(f"local turn llm done ({time.perf_counter() - started:.2f}s)", flush=True)
-        await websocket.send_json({"type": "response.text.done", "turn_id": turn_id, "text": reply, "final": True})
+        await send_event(websocket, send_lock, {"type": "response.text.done", "turn_id": turn_id, "text": reply, "final": True})
         audio = await asyncio.to_thread(synthesize_sapi, reply)
         print(f"local turn tts done: {len(audio)} bytes ({time.perf_counter() - started:.2f}s)", flush=True)
         for offset in range(0, len(audio), 4800):
             chunk = base64.b64encode(audio[offset:offset + 4800]).decode()
-            await websocket.send_json({"type": "response.audio.delta", "turn_id": turn_id, "delta": chunk})
-        await websocket.send_json({"type": "response.audio.done", "turn_id": turn_id})
+            await send_event(websocket, send_lock, {"type": "response.audio.delta", "turn_id": turn_id, "delta": chunk})
+            # A buffered WebSocket send need not yield; let barge-in be read
+            # even while many audio chunks are ready to send.
+            await asyncio.sleep(0)
+        await send_event(websocket, send_lock, {"type": "response.audio.done", "turn_id": turn_id})
+    except asyncio.CancelledError:
+        print(f"local turn cancelled: {turn_id}", flush=True)
+        raise
     except WebSocketDisconnect:
         # The Android client may close/reconnect while local STT/LLM/TTS is
         # still running. Do not attempt to send a second error frame after
@@ -163,7 +177,7 @@ async def local_turn(websocket: WebSocket, pcm: bytes, turn_id: str):
         return
     except Exception as error:
         with suppress(Exception):
-            await websocket.send_json({"type": "error", "message": str(error)})
+            await send_event(websocket, send_lock, {"type": "error", "turn_id": turn_id, "message": str(error)})
 
 
 async def openai_relay(client: WebSocket):
@@ -193,7 +207,8 @@ async def openai_relay(client: WebSocket):
 async def realtime(websocket: WebSocket):
     await websocket.accept()
     mode = provider_name()
-    await websocket.send_json({"type": "server.ready", "provider": mode})
+    send_lock = asyncio.Lock()
+    await send_event(websocket, send_lock, {"type": "server.ready", "provider": mode})
     if mode == "openai":
         try:
             await openai_relay(websocket)
@@ -202,21 +217,50 @@ async def realtime(websocket: WebSocket):
         return
     pcm_buffer = bytearray()
     turn_index = 0
+    current_turn_task: asyncio.Task | None = None
+    current_turn_id: str | None = None
+
+    async def cancel_current_turn(notify: bool = True):
+        nonlocal current_turn_task, current_turn_id
+        task = current_turn_task
+        turn_id = current_turn_id
+        if task is not None and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        # The response may already be sent but still queued on the phone.
+        if notify and turn_id is not None:
+            await send_event(websocket, send_lock, {"type": "response.cancelled", "turn_id": turn_id})
+        current_turn_task = None
+        current_turn_id = None
+
     try:
         while True:
             event = json.loads(await websocket.receive_text())
             event_type = event.get("type")
             if event_type == "input_audio_buffer.append":
                 pcm_buffer.extend(base64.b64decode(event.get("audio", "")))
+            elif event_type == "input_audio_buffer.speech_started":
+                # Barge-in: a new speech segment interrupts the current local
+                # STT/LLM/TTS turn while the receive loop keeps accepting audio.
+                await cancel_current_turn()
+                pcm_buffer.clear()
+            elif event_type == "input_audio_buffer.clear":
+                pcm_buffer.clear()
+            elif event_type == "response.cancel":
+                await cancel_current_turn()
             elif event_type == "input_audio_buffer.commit":
                 pcm = bytes(pcm_buffer); pcm_buffer.clear()
                 turn_index += 1
-                turn_id = f"turn-{turn_index}"
-                # The Android client is half-duplex. Process one local turn
-                # inline so a noisy VAD edge cannot start overlapping STT/LLM/TTS
-                # jobs and leave the client waiting for a later audio.done.
-                await local_turn(websocket, pcm, turn_id)
+                # Echo the client's ID so it can reject late frames from a
+                # cancelled response without waiting for an acknowledgement.
+                turn_id = str(event.get("turn_id") or f"turn-{turn_index}")[:128]
+                await cancel_current_turn(notify=False)
+                current_turn_id = turn_id
+                current_turn_task = asyncio.create_task(local_turn(websocket, send_lock, pcm, turn_id))
             elif event_type == "session.update":
-                await websocket.send_json({"type": "session.updated", "provider": "local"})
+                await send_event(websocket, send_lock, {"type": "session.updated", "provider": "local"})
     except WebSocketDisconnect:
         pass
+    finally:
+        await cancel_current_turn(notify=False)
