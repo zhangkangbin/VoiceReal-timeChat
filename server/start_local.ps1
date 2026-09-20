@@ -6,5 +6,5 @@ if (-not (Test-Path -LiteralPath $lms)) { throw "找不到 LM Studio lms.exe：$
 # Keep one fast local model resident on the RTX 5060 Ti.  A single
 # generation lane is the right setting for one voice conversation: it avoids
 # duplicate model instances and gives the active request the full GPU path.
-& $lms load "google/gemma-2-27b" --gpu max --context-length 4096 --parallel 1 --identifier "google/gemma-2-27b" --yes
+& $lms load "google/gemma-3-4b" --gpu max --context-length 4096 --parallel 1 --identifier "google/gemma-3-4b" --yes
 & .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000

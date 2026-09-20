@@ -1,9 +1,12 @@
 import asyncio
 import audioop
 import base64
+import io
 import json
 import os
+from pathlib import Path
 import subprocess
+import sys
 import time
 import tempfile
 import wave
@@ -14,17 +17,32 @@ import httpx
 import websockets
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 
 load_dotenv()
 app = FastAPI(title="Local Realtime Voice Chat Server", version="0.2.0")
+TEST_PAGE = (Path(__file__).with_name("test_page.html")).read_text(encoding="utf-8")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
 _whisper = None
+_cuda_dll_handles = []
 # Cancelling an asyncio task cannot stop a running CTranslate2 call. Keep
 # serialization in the worker, so a cancelled job never overlaps the next one.
 _stt_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="local-stt")
+
+
+def configure_cuda_runtime() -> None:
+    """Make CUDA DLLs installed by NVIDIA's pip wheels visible on Windows."""
+    if os.name != "nt" or _cuda_dll_handles:
+        return
+    nvidia_root = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
+    if not nvidia_root.is_dir():
+        return
+    for dll_dir in sorted(nvidia_root.rglob("bin")):
+        if dll_dir.is_dir():
+            _cuda_dll_handles.append(os.add_dll_directory(str(dll_dir)))
+            os.environ["PATH"] = str(dll_dir) + os.pathsep + os.environ.get("PATH", "")
 
 
 def provider_name() -> str:
@@ -33,21 +51,26 @@ def provider_name() -> str:
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-2-27b"), "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE}
+    whisper_engine = getattr(_whisper, "model", None)
+    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-4b"), "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE, "whisper_loaded": _whisper is not None, "whisper_device": getattr(whisper_engine, "device", None), "whisper_compute_type": getattr(whisper_engine, "compute_type", None)}
 
 
 @app.get("/", response_class=HTMLResponse)
 async def test_page():
-    return HTMLResponse("""<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>本地大模型测试</title><style>body{font-family:system-ui;max-width:760px;margin:40px auto;padding:0 16px}textarea{width:100%;height:110px;padding:10px}button{padding:10px 18px;margin:10px 0}#out{white-space:pre-wrap;background:#f4f4f4;padding:14px;min-height:80px}.ok{color:green}.err{color:#b00}</style></head>
-<body><h1>本地大模型测试</h1><p>入口：FastAPI + LM Studio。本页面不会调用云端服务。</p><p id="health">检查本地服务中…</p>
-<textarea id="prompt" placeholder="输入一句话，例如：用一句话介绍你自己"></textarea><br><button onclick="send()">发送给本地模型</button><div id="out"></div>
-<script>
-async function check(){try{let r=await fetch('/health');let x=await r.json();document.querySelector('#health').textContent='服务正常｜模型：'+x.lmstudio_model+'｜模式：'+x.provider;document.querySelector('#health').className='ok'}catch(e){document.querySelector('#health').textContent='服务不可用';document.querySelector('#health').className='err'}}
-async function send(){let out=document.querySelector('#out');out.textContent='本地模型生成中…';try{let r=await fetch('/api/local-chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:document.querySelector('#prompt').value})});let x=await r.json();if(!r.ok)throw new Error(x.detail||x.message||'请求失败');out.textContent=x.reply}catch(e){out.textContent='错误：'+e.message}}
-check();
-</script></body></html>""")
+    return HTMLResponse(TEST_PAGE)
+
+
+@app.get("/api/test-default-audio")
+async def test_default_audio():
+    """Return a generated Chinese test utterance as a playable WAV file."""
+    pcm = await asyncio.to_thread(synthesize_sapi, "请介绍一下你自己，并说一句本地测试成功")
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(24000)
+        wav.writeframes(pcm)
+    return Response(content=output.getvalue(), media_type="audio/wav")
 
 
 @app.post("/api/local-chat")
@@ -69,11 +92,13 @@ def transcribe_pcm(pcm: bytes) -> str:
     global _whisper
     if not pcm:
         return ""
+    configure_cuda_runtime()
     if _whisper is None:
         from faster_whisper import WhisperModel
         try:
             _whisper = WhisperModel(WHISPER_MODEL, device=WHISPER_DEVICE, compute_type="float16" if WHISPER_DEVICE == "cuda" else "int8")
-        except Exception:
+        except Exception as error:
+            print(f"Whisper CUDA unavailable; falling back to CPU: {type(error).__name__}: {error}", flush=True)
             _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
     # faster-whisper accepts an audio array or a media file. Write a temporary
     # WAV so the Android PCM format is explicit and reproducible.
@@ -98,9 +123,10 @@ def transcribe_pcm(pcm: bytes) -> str:
             return "".join(segment.text for segment in segments).strip()
         try:
             return run_transcription(_whisper)
-        except Exception:
+        except Exception as error:
             if WHISPER_DEVICE != "cuda":
                 raise
+            print(f"Whisper CUDA transcription failed; falling back to CPU: {type(error).__name__}: {error}", flush=True)
             from faster_whisper import WhisperModel
             _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
             return run_transcription(_whisper)
@@ -111,7 +137,7 @@ def transcribe_pcm(pcm: bytes) -> str:
 
 async def ask_lmstudio(text: str) -> str:
     url = os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1").rstrip("/") + "/chat/completions"
-    payload = {"model": os.getenv("LMSTUDIO_MODEL", "google/gemma-2-27b"), "messages": [
+    payload = {"model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-4b"), "messages": [
         {"role": "system", "content": "你是一个自然、简洁、友好的中文语音助手。回答适合直接朗读，不要使用 Markdown。"},
         {"role": "user", "content": text}], "stream": False, "temperature": 0.3, "max_tokens": 128}
     async with httpx.AsyncClient(timeout=120, trust_env=False) as client:

@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>本地语音链路测试</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+    body { max-width: 900px; margin: 0 auto; padding: 28px 18px 56px; color: #172033; background: #f7f8fb; }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    h2 { margin: 0 0 10px; font-size: 20px; }
+    .sub { color: #5d6677; margin: 0 0 22px; }
+    .card { background: white; border: 1px solid #e2e6ee; border-radius: 14px; padding: 18px; margin: 14px 0; box-shadow: 0 3px 14px #15213b0d; }
+    button { border: 0; border-radius: 9px; padding: 10px 15px; margin: 5px 8px 5px 0; font-size: 15px; cursor: pointer; background: #2563eb; color: white; }
+    button.secondary { background: #e8eefc; color: #1d4ed8; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    audio { width: 100%; margin-top: 8px; }
+    #status { color: #475569; }
+    #status.ok { color: #15803d; }
+    #status.err { color: #b91c1c; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
+    .metric { background: #f8fafc; border-radius: 10px; padding: 12px; }
+    .metric label { display: block; color: #64748b; font-size: 13px; }
+    .metric strong { display: block; font-size: 20px; margin-top: 4px; }
+    pre { white-space: pre-wrap; background: #f8fafc; border-radius: 10px; padding: 13px; min-height: 42px; margin: 8px 0 0; }
+    .hint { color: #64748b; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>本地语音链路测试</h1>
+  <p class="sub">测试路径：语音 → Whisper 转文字 → LM Studio 回答 → SAPI 返回语音。数据只发送到当前服务。</p>
+
+  <section class="card">
+    <div id="status">正在连接服务…</div>
+    <div class="hint" id="modelInfo"></div>
+  </section>
+
+  <section class="card">
+    <h2>默认语音</h2>
+    <p>默认内容：<span id="defaultText">请介绍一下你自己，并说一句本地测试成功</span></p>
+    <audio id="defaultAudio" controls preload="none" src="/api/test-default-audio"></audio>
+    <div><button id="defaultBtn" onclick="runDefault()">使用默认语音测试</button></div>
+    <p class="hint">点击按钮会生成一段本地中文 WAV，随后自动送入 Whisper。</p>
+  </section>
+
+  <section class="card">
+    <h2>麦克风语音</h2>
+    <button id="recordBtn" onclick="toggleRecording()">开始录音</button>
+    <button class="secondary" id="stopBtn" onclick="stopRecording()" disabled>停止并测试</button>
+    <span id="recordState" class="hint"></span>
+  </section>
+
+  <section class="card">
+    <h2>识别与回答</h2>
+    <div class="hint">识别文字</div><pre id="transcript">尚未测试</pre>
+    <div class="hint">大模型回答</div><pre id="reply">尚未测试</pre>
+    <div class="hint">返回语音</div><audio id="replyAudio" controls></audio>
+  </section>
+
+  <section class="card">
+    <h2>耗时</h2>
+    <div class="grid">
+      <div class="metric"><label>音频上传</label><strong id="uploadMs">—</strong></div>
+      <div class="metric"><label>Whisper 转文字</label><strong id="sttMs">—</strong></div>
+      <div class="metric"><label>大模型回答</label><strong id="llmMs">—</strong></div>
+      <div class="metric"><label>语音合成</label><strong id="ttsMs">—</strong></div>
+      <div class="metric"><label>总耗时（提交后）</label><strong id="totalMs">—</strong></div>
+    </div>
+  </section>
+
+  <script>
+    let socket, recording = false, audioContext, source, processor, inputStream, recorded = [], inputRate = 48000;
+    const $ = id => document.getElementById(id);
+    const stamp = () => performance.now();
+    const wsUrl = () => `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/realtime`;
+
+    async function checkHealth() {
+      try {
+        const r = await fetch('/health'), x = await r.json();
+        $('status').textContent = '服务正常，可开始测试'; $('status').className = 'ok';
+        $('modelInfo').textContent = `模型：${x.lmstudio_model} ｜ Whisper：${x.whisper_model} ｜ 模式：${x.provider}`;
+      } catch (e) { $('status').textContent = '服务不可用：' + e.message; $('status').className = 'err'; }
+    }
+
+    function connect() {
+      return new Promise((resolve, reject) => {
+        socket = new WebSocket(wsUrl());
+        socket.onmessage = e => { if (JSON.parse(e.data).type === 'server.ready') resolve(); };
+        socket.onerror = () => reject(new Error('WebSocket 连接失败'));
+      });
+    }
+
+    function b64(bytes) {
+      let s = ''; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+      return btoa(s);
+    }
+
+    function pcm16(samples) {
+      const out = new Int16Array(samples.length);
+      for (let i = 0; i < samples.length; i++) out[i] = Math.max(-1, Math.min(1, samples[i])) * 32767;
+      return new Uint8Array(out.buffer);
+    }
+
+    function downsample(input, fromRate, toRate) {
+      if (fromRate === toRate) return input;
+      const ratio = fromRate / toRate, output = new Float32Array(Math.round(input.length / ratio));
+      for (let i = 0; i < output.length; i++) {
+        const pos = i * ratio, left = Math.floor(pos), right = Math.min(left + 1, input.length - 1), weight = pos - left;
+        output[i] = input[left] * (1 - weight) + input[right] * weight;
+      }
+      return output;
+    }
+
+    async function wavToPcm16(url) {
+      const data = await (await fetch(url)).arrayBuffer(), ctx = new AudioContext(), buffer = await ctx.decodeAudioData(data);
+      const mono = new Float32Array(buffer.length);
+      for (let c = 0; c < buffer.numberOfChannels; c++) {
+        const channel = buffer.getChannelData(c);
+        for (let i = 0; i < buffer.length; i++) mono[i] += channel[i] / buffer.numberOfChannels;
+      }
+      await ctx.close(); return pcm16(downsample(mono, buffer.sampleRate, 16000));
+    }
+
+    function clearResult() {
+      $('transcript').textContent = '识别中…'; $('reply').textContent = '等待模型回答…';
+      ['uploadMs','sttMs','llmMs','ttsMs','totalMs'].forEach(id => $(id).textContent = '—');
+    }
+
+    async function sendPcm(pcm, label) {
+      clearResult(); $('status').textContent = label + '：连接中…'; $('status').className = '';
+      await connect();
+      const t0 = stamp(); let appendDone, commitAt, transcriptAt, textAt, firstAudioAt, doneAt;
+      const audioParts = [];
+      socket.onmessage = e => {
+        const msg = JSON.parse(e.data), now = stamp();
+        if (msg.type === 'conversation.transcript') { transcriptAt = now; $('transcript').textContent = msg.text || '(空)'; }
+        else if (msg.type === 'response.text.done') { textAt = now; $('reply').textContent = msg.text || ''; }
+        else if (msg.type === 'response.audio.delta') {
+          if (!firstAudioAt) firstAudioAt = now;
+          const raw = atob(msg.delta), bytes = new Uint8Array(raw.length);
+          for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i); audioParts.push(bytes);
+        } else if (msg.type === 'response.audio.done') {
+          doneAt = now; finishMetrics(); playReply(audioParts); $('status').textContent = '测试完成：' + label; $('status').className = 'ok'; socket.close();
+        } else if (msg.type === 'error') { $('status').textContent = '测试失败：' + msg.message; $('status').className = 'err'; socket.close(); }
+      };
+      for (let offset = 0; offset < pcm.length; offset += 4800) socket.send(JSON.stringify({type:'input_audio_buffer.append', audio:b64(pcm.subarray(offset, offset + 4800))}));
+      appendDone = stamp(); commitAt = stamp(); socket.send(JSON.stringify({type:'input_audio_buffer.commit', turn_id:'web-' + Date.now()}));
+      function finishMetrics() {
+        const fmt = x => x == null ? '—' : `${x.toFixed(0)} ms`;
+        $('uploadMs').textContent = fmt(appendDone - t0); $('sttMs').textContent = fmt(transcriptAt - commitAt);
+        $('llmMs').textContent = fmt(textAt - transcriptAt); $('ttsMs').textContent = fmt(firstAudioAt - textAt); $('totalMs').textContent = fmt(doneAt - commitAt);
+      }
+    }
+
+    function wavBlob(parts) {
+      const length = parts.reduce((n, p) => n + p.length, 0), data = new Uint8Array(length); let pos = 0;
+      for (const p of parts) { data.set(p, pos); pos += p.length; }
+      const header = new ArrayBuffer(44), view = new DataView(header), text = (o, s) => [...s].forEach((c, i) => view.setUint8(o + i, c.charCodeAt(0)));
+      text(0,'RIFF'); view.setUint32(4,36+length,true); text(8,'WAVE'); text(12,'fmt '); view.setUint32(16,16,true); view.setUint16(20,1,true); view.setUint16(22,1,true); view.setUint32(24,24000,true); view.setUint32(28,48000,true); view.setUint16(32,2,true); view.setUint16(34,16,true); text(36,'data'); view.setUint32(40,length,true);
+      return URL.createObjectURL(new Blob([header, data], {type:'audio/wav'}));
+    }
+
+    function playReply(parts) { if (parts.length) { $('replyAudio').src = wavBlob(parts); $('replyAudio').play().catch(() => {}); } }
+    async function runDefault() {
+      $('defaultBtn').disabled = true;
+      try { await sendPcm(await wavToPcm16('/api/test-default-audio'), '默认语音'); }
+      catch (e) { $('status').textContent = '默认语音测试失败：' + e.message; $('status').className = 'err'; }
+      finally { $('defaultBtn').disabled = false; }
+    }
+
+    async function toggleRecording() {
+      if (recording) return;
+      try {
+        inputStream = await navigator.mediaDevices.getUserMedia({audio:{channelCount:1, echoCancellation:true, noiseSuppression:true, autoGainControl:true}});
+        audioContext = new AudioContext(); inputRate = audioContext.sampleRate; source = audioContext.createMediaStreamSource(inputStream); processor = audioContext.createScriptProcessor(4096,1,1); recorded = [];
+        processor.onaudioprocess = e => { if (recording) recorded.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+        source.connect(processor); const mute = audioContext.createGain(); mute.gain.value = 0; processor.connect(mute); mute.connect(audioContext.destination);
+        recording = true; $('recordBtn').disabled = true; $('stopBtn').disabled = false; $('recordState').textContent = '录音中…说完后点击停止';
+      } catch (e) { $('status').textContent = '无法使用麦克风：' + e.message; $('status').className = 'err'; }
+    }
+
+    async function stopRecording() {
+      if (!recording) return; recording = false; processor.disconnect(); source.disconnect(); inputStream.getTracks().forEach(t => t.stop()); await audioContext.close();
+      const length = recorded.reduce((n, x) => n + x.length, 0), all = new Float32Array(length); let pos = 0; for (const x of recorded) { all.set(x, pos); pos += x.length; }
+      $('recordBtn').disabled = false; $('stopBtn').disabled = true; $('recordState').textContent = '';
+      if (all.length) await sendPcm(pcm16(downsample(all, inputRate, 16000)), '麦克风');
+    }
+    checkHealth();
+  </script>
+</body>
+</html>
