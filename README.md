@@ -53,3 +53,32 @@ cd server
 ```
 
 真机验收：开始会话，提问后在回答播放中说“停一下，换个问题”；应立即停播，并在新一句结束后显示新的识别和回答。连续打断三次、停止后重启会话，再测试扬声器不同音量下是否发生自我打断。
+
+## Function Call
+
+服务端现在提供统一的工具注册和执行机制，默认包含 `get_current_time`：
+
+```text
+用户：现在几点？
+模型：调用 get_current_time
+服务端：执行工具并返回结构化时间
+模型：根据工具结果生成最终语音回答
+```
+
+工具定义和执行器位于 `server/app/tools.py`。本地 LM Studio 模式会在 Chat Completions 请求中发送 `tools`，收到 `tool_calls` 后由 FastAPI 执行工具，再把 `tool` 结果发回模型；OpenAI Realtime 模式会在 `session.update` 中注册同一工具，并由 FastAPI 处理 `function_call_output`。
+
+可通过环境变量控制：
+
+```text
+FUNCTION_CALLS_ENABLED=true
+MAX_TOOL_CALL_ROUNDS=3
+```
+
+如果当前 LM Studio 模型不支持工具调用，服务端会记录日志并回退到普通对话。要实际使用 Function Call，应在 LM Studio 中加载支持 tool calling 的 Instruct 模型。增加业务函数时，在 `server/app/tools.py` 中新增参数 schema、异步 handler，并加入 `TOOL_HANDLERS` 注册表。
+
+服务端回归测试：
+
+```powershell
+cd server
+.\.venv\Scripts\python.exe -m unittest -v test_full_duplex.py test_function_call.py
+```

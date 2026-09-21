@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
 
+from .tools import TOOL_DEFINITIONS, execute_tool, realtime_tool_definitions, tool_names
+
 load_dotenv()
 app = FastAPI(title="Local Realtime Voice Chat Server", version="0.2.0")
 TEST_PAGE = (Path(__file__).with_name("test_page.html")).read_text(encoding="utf-8")
@@ -26,6 +28,8 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
 MAX_HISTORY_TURNS = max(1, int(os.getenv("MAX_HISTORY_TURNS", "30")))
+MAX_TOOL_CALL_ROUNDS = max(1, int(os.getenv("MAX_TOOL_CALL_ROUNDS", "3")))
+FUNCTION_CALLS_ENABLED = os.getenv("FUNCTION_CALLS_ENABLED", "true").lower() not in {"0", "false", "no", "off"}
 _whisper = None
 _cuda_dll_handles = []
 # Cancelling an asyncio task cannot stop a running CTranslate2 call. Keep
@@ -53,7 +57,7 @@ def provider_name() -> str:
 @app.get("/health")
 async def health():
     whisper_engine = getattr(_whisper, "model", None)
-    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE, "max_history_turns": MAX_HISTORY_TURNS, "whisper_loaded": _whisper is not None, "whisper_device": getattr(whisper_engine, "device", None), "whisper_compute_type": getattr(whisper_engine, "compute_type", None)}
+    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE, "max_history_turns": MAX_HISTORY_TURNS, "function_calls_enabled": FUNCTION_CALLS_ENABLED, "tools": tool_names(), "whisper_loaded": _whisper is not None, "whisper_device": getattr(whisper_engine, "device", None), "whisper_compute_type": getattr(whisper_engine, "compute_type", None)}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -138,15 +142,54 @@ def transcribe_pcm(pcm: bytes) -> str:
 
 async def ask_lmstudio(text: str, history: list[dict] | None = None) -> str:
     url = os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1").rstrip("/") + "/chat/completions"
-    messages = [{"role": "system", "content": "你是一个自然、简洁、友好的中文语音助手。回答适合直接朗读，不要使用 Markdown。请记住本次会话中用户告诉你的信息，并在后续问题中使用这些信息。"}]
+    messages = [{"role": "system", "content": "你是一个自然、简洁、友好的中文语音助手。回答适合直接朗读，不要使用 Markdown。请记住本次会话中用户告诉你的信息，并在后续问题中使用这些信息。如果用户询问当前时间，请调用 get_current_time，不要猜测时间。"}]
     if history:
         messages.extend(history[-(MAX_HISTORY_TURNS * 2):])
     messages.append({"role": "user", "content": text})
-    payload = {"model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "messages": messages, "stream": False, "temperature": 0.3, "max_tokens": 128}
+    tools_enabled = FUNCTION_CALLS_ENABLED
     async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
-        response = await client.post(url, json=payload)
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"].strip()
+        for tool_round in range(MAX_TOOL_CALL_ROUNDS + 1):
+            payload = {"model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "messages": messages, "stream": False, "temperature": 0.3, "max_tokens": 128}
+            if tools_enabled:
+                payload["tools"] = TOOL_DEFINITIONS
+                payload["tool_choice"] = "auto"
+            try:
+                response = await client.post(url, json=payload)
+                response.raise_for_status()
+            except httpx.HTTPStatusError as error:
+                # Some local models expose a Chat Completions-compatible API
+                # without tool support. Keep ordinary chat usable in that case.
+                if tools_enabled and error.response.status_code == 400:
+                    print("LM Studio rejected tools; retrying without function calls", flush=True)
+                    tools_enabled = False
+                    continue
+                raise
+
+            message = response.json()["choices"][0]["message"]
+            tool_calls = list(message.get("tool_calls") or [])
+            legacy_call = message.get("function_call")
+            if legacy_call and not tool_calls:
+                tool_calls = [{"id": f"legacy-tool-{tool_round}", "type": "function", "function": legacy_call}]
+            if not tool_calls:
+                return str(message.get("content") or "").strip()
+            if tool_round >= MAX_TOOL_CALL_ROUNDS:
+                return "抱歉，工具调用次数超过限制，暂时无法完成这个请求。"
+
+            # Preserve the assistant tool-call message before appending each
+            # tool result, as required by the Chat Completions protocol.
+            messages.append({"role": "assistant", "content": message.get("content"), "tool_calls": tool_calls})
+            for call in tool_calls:
+                function = call.get("function") or {}
+                name = str(function.get("name") or "")
+                arguments = function.get("arguments") or "{}"
+                result = await execute_tool(name, arguments)
+                print(f"function call: {name} -> {result.get('ok')}", flush=True)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": str(call.get("id") or f"tool-{tool_round}"),
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+        return "抱歉，暂时无法完成这个请求。"
 
 
 def synthesize_sapi(text: str) -> bytes:
@@ -213,20 +256,65 @@ async def local_turn(websocket: WebSocket, send_lock: asyncio.Lock, pcm: bytes, 
             await send_event(websocket, send_lock, {"type": "error", "turn_id": turn_id, "message": str(error)})
 
 
-async def openai_relay(client: WebSocket):
+def realtime_function_call(event: dict) -> tuple[str, str, str] | None:
+    """Extract a completed Realtime function call from either event shape."""
+    if event.get("type") == "response.function_call_arguments.done":
+        call_id = str(event.get("call_id") or "")
+        name = str(event.get("name") or "")
+        arguments = str(event.get("arguments") or "{}")
+        return (call_id, name, arguments) if call_id and name else None
+    if event.get("type") == "response.output_item.done":
+        item = event.get("item") or {}
+        if item.get("type") == "function_call":
+            call_id = str(item.get("call_id") or "")
+            name = str(item.get("name") or "")
+            arguments = str(item.get("arguments") or "{}")
+            return (call_id, name, arguments) if call_id and name else None
+    return None
+
+
+async def openai_relay(client: WebSocket, send_lock: asyncio.Lock):
     url = "wss://api.openai.com/v1/realtime?model=" + os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
     headers = {"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}", "OpenAI-Beta": "realtime=v1"}
     async with websockets.connect(url, additional_headers=headers, max_size=None) as upstream:
-        await upstream.send(json.dumps({"type": "session.update", "session": {
+        session = {
             "type": "realtime", "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}}, "output": {"format": {"type": "audio/pcm", "rate": 24000}}},
             "output_modalities": ["audio"], "voice": "alloy", "turn_detection": {"type": "server_vad", "silence_duration_ms": 500},
-            "instructions": "你是一个简洁、自然、友好的中文语音助手。"}}))
+            "instructions": "你是一个简洁、自然、友好的中文语音助手。如果用户询问当前时间，请调用 get_current_time，不要猜测时间。"}
+        if FUNCTION_CALLS_ENABLED:
+            session["tools"] = realtime_tool_definitions()
+            session["tool_choice"] = "auto"
+        await upstream.send(json.dumps({"type": "session.update", "session": session}))
         async def android_to_openai():
             while True:
                 await upstream.send(await client.receive_text())
+
         async def openai_to_android():
+            handled_calls: set[str] = set()
             async for message in upstream:
-                await client.send_text(message)
+                try:
+                    event = json.loads(message)
+                except (TypeError, json.JSONDecodeError):
+                    await client.send_text(message)
+                    continue
+
+                function_call = realtime_function_call(event) if FUNCTION_CALLS_ENABLED else None
+                if function_call is None:
+                    await client.send_text(message)
+                    continue
+                call_id, name, arguments = function_call
+                if call_id in handled_calls:
+                    continue
+                handled_calls.add(call_id)
+                await send_event(client, send_lock, {"type": "tool.started", "name": name, "call_id": call_id})
+                result = await execute_tool(name, arguments)
+                await upstream.send(json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {"type": "function_call_output", "call_id": call_id, "output": json.dumps(result, ensure_ascii=False)},
+                }))
+                await upstream.send(json.dumps({"type": "response.create"}))
+                await send_event(client, send_lock, {"type": "tool.completed", "name": name, "call_id": call_id, "ok": result.get("ok", False)})
+
         tasks = [asyncio.create_task(android_to_openai()), asyncio.create_task(openai_to_android())]
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
@@ -244,7 +332,7 @@ async def realtime(websocket: WebSocket):
     await send_event(websocket, send_lock, {"type": "server.ready", "provider": mode})
     if mode == "openai":
         try:
-            await openai_relay(websocket)
+            await openai_relay(websocket, send_lock)
         except WebSocketDisconnect:
             pass
         return
