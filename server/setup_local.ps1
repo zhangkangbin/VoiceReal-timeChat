@@ -9,6 +9,6 @@ py -3.11 -m venv .venv
 & .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
 Write-Host "本地 Python 依赖安装完成。"
-Write-Host "下一步：在 LM Studio 中启动 Local Server，并加载 google/gemma-3-4b，然后执行："
+Write-Host "下一步：在 LM Studio 中启动 Local Server，并加载 google/gemma-3-12b（Instruct Q4_K_M），然后执行："
 Write-Host ".\.venv\Scripts\Activate.ps1"
 Write-Host "uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"

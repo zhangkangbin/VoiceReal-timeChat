@@ -39,7 +39,7 @@
     <h2>默认语音</h2>
     <p>默认内容：<span id="defaultText">请介绍一下你自己，并说一句本地测试成功</span></p>
     <audio id="defaultAudio" controls preload="none" src="/api/test-default-audio"></audio>
-    <div><button id="defaultBtn" onclick="runDefault()">使用默认语音测试</button></div>
+    <div><button id="defaultBtn" onclick="runDefault()">使用默认语音测试</button><button class="secondary" onclick="resetSession()">新建会话</button></div>
     <p class="hint">点击按钮会生成一段本地中文 WAV，随后自动送入 Whisper。</p>
   </section>
 
@@ -83,6 +83,7 @@
     }
 
     function connect() {
+      if (socket && socket.readyState === WebSocket.OPEN) return Promise.resolve();
       return new Promise((resolve, reject) => {
         socket = new WebSocket(wsUrl());
         socket.onmessage = e => { if (JSON.parse(e.data).type === 'server.ready') resolve(); };
@@ -140,7 +141,7 @@
           const raw = atob(msg.delta), bytes = new Uint8Array(raw.length);
           for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i); audioParts.push(bytes);
         } else if (msg.type === 'response.audio.done') {
-          doneAt = now; finishMetrics(); playReply(audioParts); $('status').textContent = '测试完成：' + label; $('status').className = 'ok'; socket.close();
+          doneAt = now; finishMetrics(); playReply(audioParts); $('status').textContent = '测试完成：' + label + '（会话上下文已保留）'; $('status').className = 'ok';
         } else if (msg.type === 'error') { $('status').textContent = '测试失败：' + msg.message; $('status').className = 'err'; socket.close(); }
       };
       for (let offset = 0; offset < pcm.length; offset += 4800) socket.send(JSON.stringify({type:'input_audio_buffer.append', audio:b64(pcm.subarray(offset, offset + 4800))}));
@@ -161,6 +162,7 @@
     }
 
     function playReply(parts) { if (parts.length) { $('replyAudio').src = wavBlob(parts); $('replyAudio').play().catch(() => {}); } }
+    function resetSession() { if (socket) socket.close(); socket = null; $('status').textContent = '已新建会话，历史上下文已清空'; $('status').className = 'ok'; }
     async function runDefault() {
       $('defaultBtn').disabled = true;
       try { await sendPcm(await wavToPcm16('/api/test-default-audio'), '默认语音'); }

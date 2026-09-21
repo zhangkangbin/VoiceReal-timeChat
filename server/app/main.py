@@ -25,6 +25,7 @@ TEST_PAGE = (Path(__file__).with_name("test_page.html")).read_text(encoding="utf
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
 WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
+MAX_HISTORY_TURNS = max(1, int(os.getenv("MAX_HISTORY_TURNS", "30")))
 _whisper = None
 _cuda_dll_handles = []
 # Cancelling an asyncio task cannot stop a running CTranslate2 call. Keep
@@ -52,7 +53,7 @@ def provider_name() -> str:
 @app.get("/health")
 async def health():
     whisper_engine = getattr(_whisper, "model", None)
-    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-4b"), "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE, "whisper_loaded": _whisper is not None, "whisper_device": getattr(whisper_engine, "device", None), "whisper_compute_type": getattr(whisper_engine, "compute_type", None)}
+    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE, "max_history_turns": MAX_HISTORY_TURNS, "whisper_loaded": _whisper is not None, "whisper_device": getattr(whisper_engine, "device", None), "whisper_compute_type": getattr(whisper_engine, "compute_type", None)}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -135,11 +136,13 @@ def transcribe_pcm(pcm: bytes) -> str:
             os.remove(path)
 
 
-async def ask_lmstudio(text: str) -> str:
+async def ask_lmstudio(text: str, history: list[dict] | None = None) -> str:
     url = os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1").rstrip("/") + "/chat/completions"
-    payload = {"model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-4b"), "messages": [
-        {"role": "system", "content": "你是一个自然、简洁、友好的中文语音助手。回答适合直接朗读，不要使用 Markdown。"},
-        {"role": "user", "content": text}], "stream": False, "temperature": 0.3, "max_tokens": 128}
+    messages = [{"role": "system", "content": "你是一个自然、简洁、友好的中文语音助手。回答适合直接朗读，不要使用 Markdown。请记住本次会话中用户告诉你的信息，并在后续问题中使用这些信息。"}]
+    if history:
+        messages.extend(history[-(MAX_HISTORY_TURNS * 2):])
+    messages.append({"role": "user", "content": text})
+    payload = {"model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "messages": messages, "stream": False, "temperature": 0.3, "max_tokens": 128}
     async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
         response = await client.post(url, json=payload)
         response.raise_for_status()
@@ -169,7 +172,7 @@ async def send_event(websocket: WebSocket, send_lock: asyncio.Lock, payload: dic
         await websocket.send_json(payload)
 
 
-async def local_turn(websocket: WebSocket, send_lock: asyncio.Lock, pcm: bytes, turn_id: str):
+async def local_turn(websocket: WebSocket, send_lock: asyncio.Lock, pcm: bytes, turn_id: str, history: list[dict]):
     started = time.perf_counter()
     print(f"local turn start: {len(pcm)} bytes", flush=True)
     try:
@@ -181,7 +184,11 @@ async def local_turn(websocket: WebSocket, send_lock: asyncio.Lock, pcm: bytes, 
         if not text:
             await send_event(websocket, send_lock, {"type": "response.audio.done", "turn_id": turn_id})
             return
-        reply = await ask_lmstudio(text)
+        # Keep the first-turn call compatible with simple provider adapters;
+        # subsequent turns receive the accumulated conversation history.
+        reply = await ask_lmstudio(text, history) if history else await ask_lmstudio(text)
+        history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": reply}])
+        del history[:-(MAX_HISTORY_TURNS * 2)]
         print(f"local turn llm done ({time.perf_counter() - started:.2f}s)", flush=True)
         await send_event(websocket, send_lock, {"type": "response.text.done", "turn_id": turn_id, "text": reply, "final": True})
         audio = await asyncio.to_thread(synthesize_sapi, reply)
@@ -242,6 +249,7 @@ async def realtime(websocket: WebSocket):
             pass
         return
     pcm_buffer = bytearray()
+    history: list[dict] = []
     turn_index = 0
     current_turn_task: asyncio.Task | None = None
     current_turn_id: str | None = None
@@ -283,7 +291,7 @@ async def realtime(websocket: WebSocket):
                 turn_id = str(event.get("turn_id") or f"turn-{turn_index}")[:128]
                 await cancel_current_turn(notify=False)
                 current_turn_id = turn_id
-                current_turn_task = asyncio.create_task(local_turn(websocket, send_lock, pcm, turn_id))
+                current_turn_task = asyncio.create_task(local_turn(websocket, send_lock, pcm, turn_id, history))
             elif event_type == "session.update":
                 await send_event(websocket, send_lock, {"type": "session.updated", "provider": "local"})
     except WebSocketDisconnect:
