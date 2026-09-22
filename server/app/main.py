@@ -11,6 +11,7 @@ import time
 import tempfile
 import wave
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from contextlib import suppress
 
 import httpx
@@ -19,6 +20,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
 
+from .memory import DEFAULT_USER_ID, MemoryService, memory_service
 from .tools import TOOL_DEFINITIONS, execute_tool, realtime_tool_definitions, tool_names
 
 load_dotenv()
@@ -30,6 +32,8 @@ WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
 MAX_HISTORY_TURNS = max(1, int(os.getenv("MAX_HISTORY_TURNS", "30")))
 MAX_TOOL_CALL_ROUNDS = max(1, int(os.getenv("MAX_TOOL_CALL_ROUNDS", "3")))
 FUNCTION_CALLS_ENABLED = os.getenv("FUNCTION_CALLS_ENABLED", "true").lower() not in {"0", "false", "no", "off"}
+MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "true").lower() not in {"0", "false", "no", "off"}
+_turn_context: ContextVar[dict] = ContextVar("turn_context", default={})
 _whisper = None
 _cuda_dll_handles = []
 # Cancelling an asyncio task cannot stop a running CTranslate2 call. Keep
@@ -57,7 +61,7 @@ def provider_name() -> str:
 @app.get("/health")
 async def health():
     whisper_engine = getattr(_whisper, "model", None)
-    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE, "max_history_turns": MAX_HISTORY_TURNS, "function_calls_enabled": FUNCTION_CALLS_ENABLED, "tools": tool_names(), "whisper_loaded": _whisper is not None, "whisper_device": getattr(whisper_engine, "device", None), "whisper_compute_type": getattr(whisper_engine, "compute_type", None)}
+    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE, "max_history_turns": MAX_HISTORY_TURNS, "function_calls_enabled": FUNCTION_CALLS_ENABLED, "memory_enabled": MEMORY_ENABLED, "memory_user_id": DEFAULT_USER_ID, "tools": tool_names(), "whisper_loaded": _whisper is not None, "whisper_device": getattr(whisper_engine, "device", None), "whisper_compute_type": getattr(whisper_engine, "compute_type", None)}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -84,6 +88,18 @@ async def local_chat(payload: dict):
     if not prompt:
         return {"reply": "请输入测试内容"}
     try:
+        if MEMORY_ENABLED:
+            command = await memory_service.handle_explicit_command(DEFAULT_USER_ID, prompt)
+            if command and command.get("handled"):
+                return {"reply": command["reply"]}
+            memories = await memory_service.relevant(DEFAULT_USER_ID, prompt, limit=8)
+            token = _turn_context.set({"user_id": DEFAULT_USER_ID, "memory_context": memories})
+            try:
+                reply = await ask_lmstudio(prompt)
+            finally:
+                _turn_context.reset(token)
+            await memory_service.extract_explicit(DEFAULT_USER_ID, prompt)
+            return {"reply": reply}
         return {"reply": await ask_lmstudio(prompt)}
     except httpx.ConnectError:
         from fastapi import HTTPException
@@ -142,7 +158,14 @@ def transcribe_pcm(pcm: bytes) -> str:
 
 async def ask_lmstudio(text: str, history: list[dict] | None = None) -> str:
     url = os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1").rstrip("/") + "/chat/completions"
-    messages = [{"role": "system", "content": "你是一个自然、简洁、友好的中文语音助手。回答适合直接朗读，不要使用 Markdown。请记住本次会话中用户告诉你的信息，并在后续问题中使用这些信息。如果用户询问当前时间，请调用 get_current_time，不要猜测时间。"}]
+    turn_context = _turn_context.get({})
+    system_prompt = "你是一个自然、简洁、友好的中文语音助手。回答适合直接朗读，不要使用 Markdown。请记住本次会话中用户告诉你的信息，并在后续问题中使用这些信息。如果用户询问当前时间，请调用 get_current_time，不要猜测时间。"
+    if MEMORY_ENABLED:
+        system_prompt += " 如果用户明确要求记住、忘记或查看记忆，请使用 memory_save、memory_delete 或 memory_list。只有明确表达的偏好、习惯或事实才保存。"
+        memory_prompt = MemoryService.prompt_context(turn_context.get("memory_context", []))
+        if memory_prompt:
+            system_prompt += "\n\n" + memory_prompt
+    messages = [{"role": "system", "content": system_prompt}]
     if history:
         messages.extend(history[-(MAX_HISTORY_TURNS * 2):])
     messages.append({"role": "user", "content": text})
@@ -151,7 +174,11 @@ async def ask_lmstudio(text: str, history: list[dict] | None = None) -> str:
         for tool_round in range(MAX_TOOL_CALL_ROUNDS + 1):
             payload = {"model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "messages": messages, "stream": False, "temperature": 0.3, "max_tokens": 128}
             if tools_enabled:
-                payload["tools"] = TOOL_DEFINITIONS
+                available_tools = [
+                    tool for tool in TOOL_DEFINITIONS
+                    if MEMORY_ENABLED or not tool["function"]["name"].startswith("memory_")
+                ]
+                payload["tools"] = available_tools
                 payload["tool_choice"] = "auto"
             try:
                 response = await client.post(url, json=payload)
@@ -182,7 +209,7 @@ async def ask_lmstudio(text: str, history: list[dict] | None = None) -> str:
                 function = call.get("function") or {}
                 name = str(function.get("name") or "")
                 arguments = function.get("arguments") or "{}"
-                result = await execute_tool(name, arguments)
+                result = await execute_tool(name, arguments, context=turn_context)
                 print(f"function call: {name} -> {result.get('ok')}", flush=True)
                 messages.append({
                     "role": "tool",
@@ -215,7 +242,8 @@ async def send_event(websocket: WebSocket, send_lock: asyncio.Lock, payload: dic
         await websocket.send_json(payload)
 
 
-async def local_turn(websocket: WebSocket, send_lock: asyncio.Lock, pcm: bytes, turn_id: str, history: list[dict]):
+async def local_turn(websocket: WebSocket, send_lock: asyncio.Lock, pcm: bytes, turn_id: str,
+                     history: list[dict], user_id: str = DEFAULT_USER_ID):
     started = time.perf_counter()
     print(f"local turn start: {len(pcm)} bytes", flush=True)
     try:
@@ -227,9 +255,24 @@ async def local_turn(websocket: WebSocket, send_lock: asyncio.Lock, pcm: bytes, 
         if not text:
             await send_event(websocket, send_lock, {"type": "response.audio.done", "turn_id": turn_id})
             return
-        # Keep the first-turn call compatible with simple provider adapters;
-        # subsequent turns receive the accumulated conversation history.
-        reply = await ask_lmstudio(text, history) if history else await ask_lmstudio(text)
+        command = await memory_service.handle_explicit_command(user_id, text, turn_id) if MEMORY_ENABLED else None
+        if command and command.get("handled"):
+            reply = str(command["reply"])
+        else:
+            memories = await memory_service.relevant(user_id, text, limit=8) if MEMORY_ENABLED else []
+            token = _turn_context.set({
+                "user_id": user_id,
+                "turn_id": turn_id,
+                "memory_context": memories,
+            })
+            try:
+                # Keep the first-turn call compatible with simple provider adapters;
+                # subsequent turns receive the accumulated conversation history.
+                reply = await ask_lmstudio(text, history) if history else await ask_lmstudio(text)
+            finally:
+                _turn_context.reset(token)
+            if MEMORY_ENABLED:
+                await memory_service.extract_explicit(user_id, text, turn_id)
         history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": reply}])
         del history[:-(MAX_HISTORY_TURNS * 2)]
         print(f"local turn llm done ({time.perf_counter() - started:.2f}s)", flush=True)
@@ -277,17 +320,48 @@ async def openai_relay(client: WebSocket, send_lock: asyncio.Lock):
     url = "wss://api.openai.com/v1/realtime?model=" + os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
     headers = {"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}", "OpenAI-Beta": "realtime=v1"}
     async with websockets.connect(url, additional_headers=headers, max_size=None) as upstream:
+        user_id = DEFAULT_USER_ID
+        memory_context = await memory_service.relevant(DEFAULT_USER_ID, "", limit=8) if MEMORY_ENABLED else []
+        instructions = "你是一个简洁、自然、友好的中文语音助手。如果用户询问当前时间，请调用 get_current_time，不要猜测时间。"
+        if MEMORY_ENABLED:
+            instructions += " 如果用户明确要求记住、忘记或查看记忆，请使用 memory_save、memory_delete 或 memory_list。只有明确表达的偏好、习惯或事实才保存。"
+            memory_prompt = MemoryService.prompt_context(memory_context)
+            if memory_prompt:
+                instructions += "\n\n" + memory_prompt
         session = {
             "type": "realtime", "audio": {"input": {"format": {"type": "audio/pcm", "rate": 24000}}, "output": {"format": {"type": "audio/pcm", "rate": 24000}}},
             "output_modalities": ["audio"], "voice": "alloy", "turn_detection": {"type": "server_vad", "silence_duration_ms": 500},
-            "instructions": "你是一个简洁、自然、友好的中文语音助手。如果用户询问当前时间，请调用 get_current_time，不要猜测时间。"}
+            "instructions": instructions}
         if FUNCTION_CALLS_ENABLED:
-            session["tools"] = realtime_tool_definitions()
+            session["tools"] = [
+                tool for tool in realtime_tool_definitions()
+                if MEMORY_ENABLED or not tool["name"].startswith("memory_")
+            ]
             session["tool_choice"] = "auto"
         await upstream.send(json.dumps({"type": "session.update", "session": session}))
         async def android_to_openai():
+            nonlocal user_id
             while True:
-                await upstream.send(await client.receive_text())
+                raw_event = await client.receive_text()
+                try:
+                    event = json.loads(raw_event)
+                except (TypeError, json.JSONDecodeError):
+                    await upstream.send(raw_event)
+                    continue
+                if event.get("type") == "session.update" and event.get("user_id"):
+                    user_id = str(event.pop("user_id"))[:128]
+                    # user_id is an app-local field, not a Realtime API field.
+                    # Refresh instructions with the memories for this user.
+                    if MEMORY_ENABLED:
+                        selected = await memory_service.relevant(user_id, "", limit=8)
+                        refreshed_instructions = "你是一个简洁、自然、友好的中文语音助手。如果用户询问当前时间，请调用 get_current_time，不要猜测时间。 如果用户明确要求记住、忘记或查看记忆，请使用 memory_save、memory_delete 或 memory_list。只有明确表达的偏好、习惯或事实才保存。"
+                        memory_prompt = MemoryService.prompt_context(selected)
+                        if memory_prompt:
+                            refreshed_instructions += "\n\n" + memory_prompt
+                        await upstream.send(json.dumps({"type": "session.update", "session": {"instructions": refreshed_instructions}}))
+                    if set(event) == {"type"}:
+                        continue
+                await upstream.send(json.dumps(event))
 
         async def openai_to_android():
             handled_calls: set[str] = set()
@@ -307,7 +381,7 @@ async def openai_relay(client: WebSocket, send_lock: asyncio.Lock):
                     continue
                 handled_calls.add(call_id)
                 await send_event(client, send_lock, {"type": "tool.started", "name": name, "call_id": call_id})
-                result = await execute_tool(name, arguments)
+                result = await execute_tool(name, arguments, context={"user_id": user_id, "call_id": call_id})
                 await upstream.send(json.dumps({
                     "type": "conversation.item.create",
                     "item": {"type": "function_call_output", "call_id": call_id, "output": json.dumps(result, ensure_ascii=False)},
@@ -338,6 +412,7 @@ async def realtime(websocket: WebSocket):
         return
     pcm_buffer = bytearray()
     history: list[dict] = []
+    user_id = DEFAULT_USER_ID
     turn_index = 0
     current_turn_task: asyncio.Task | None = None
     current_turn_id: str | None = None
@@ -379,8 +454,13 @@ async def realtime(websocket: WebSocket):
                 turn_id = str(event.get("turn_id") or f"turn-{turn_index}")[:128]
                 await cancel_current_turn(notify=False)
                 current_turn_id = turn_id
-                current_turn_task = asyncio.create_task(local_turn(websocket, send_lock, pcm, turn_id, history))
+                current_turn_task = asyncio.create_task(local_turn(websocket, send_lock, pcm, turn_id, history, user_id))
             elif event_type == "session.update":
+                requested_user_id = str(event.get("user_id") or "").strip()
+                if requested_user_id:
+                    if requested_user_id[:128] != user_id:
+                        history.clear()
+                    user_id = requested_user_id[:128]
                 await send_event(websocket, send_lock, {"type": "session.updated", "provider": "local"})
     except WebSocketDisconnect:
         pass

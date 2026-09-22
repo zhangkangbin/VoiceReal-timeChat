@@ -37,6 +37,12 @@ internal class VoiceClient(
     private val onAssistantText: (String, String) -> Unit
 ) {
     private val http = OkHttpClient()
+    private val userId: String by lazy {
+        val preferences = context.getSharedPreferences("voice_assistant", Context.MODE_PRIVATE)
+        preferences.getString("user_id", null) ?: UUID.randomUUID().toString().also {
+            preferences.edit().putString("user_id", it).apply()
+        }
+    }
     @Volatile private var session: Session? = null
 
     @Synchronized fun startSession() {
@@ -105,6 +111,7 @@ internal class VoiceClient(
                         synchronized(stateLock) {
                             if (!isActive()) { webSocket.close(1000, "session stopped"); return }
                             socket = webSocket
+                            send(JSONObject().put("type", "session.update").put("user_id", userId))
                             try { startCapture() } catch (error: Exception) { fail("麦克风启动失败：${error.message}", error) }
                         }
                     }

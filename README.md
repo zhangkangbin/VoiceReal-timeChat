@@ -76,6 +76,12 @@ MAX_TOOL_CALL_ROUNDS=3
 
 如果当前 LM Studio 模型不支持工具调用，服务端会记录日志并回退到普通对话。要实际使用 Function Call，应在 LM Studio 中加载支持 tool calling 的 Instruct 模型。增加业务函数时，在 `server/app/tools.py` 中新增参数 schema、异步 handler，并加入 `TOOL_HANDLERS` 注册表。
 
+新增业务函数的完整步骤和代码模板请参阅：[Function Call 开发指南](docs/Function_Call_开发指南.md)。
+
+用户长期记忆的使用方式、配置和数据结构请参阅：[用户记忆功能指南](docs/用户记忆功能指南.md)。
+
+记忆默认开启，保存到 `server/data/memory.db`；可使用 `MEMORY_ENABLED=false` 关闭。
+
 服务端回归测试：
 
 ```powershell

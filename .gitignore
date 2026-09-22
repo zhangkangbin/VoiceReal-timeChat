@@ -4,6 +4,7 @@ __pycache__/
 .env
 .idea/
 .tools/
+server/data/
 android-*.png
 android/.gradle/
 android/build/
