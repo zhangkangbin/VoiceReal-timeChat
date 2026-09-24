@@ -95,7 +95,7 @@ MAX_TOOL_CALL_ROUNDS=3
 
 - `get_weather(city)` 查询今天的天气；默认数据源是 [Open-Meteo](https://open-meteo.com/)，支持通过 `WEATHER_API_URL` 替换兼容接口。
 - `get_gold_price(currency, unit)` 查询当前金价；默认数据源是 [Gold API](https://gold-api.com/)，返回每金衡盎司价格后按请求单位换算，支持通过 `GOLD_PRICE_API_URL` 替换兼容接口。
-- `web_search(query, freshness)` 用于天气、金价以外的网络搜索。默认适配 [Brave Search API](https://api.search.brave.com/app/documentation/web-search/get-started)，调用服务端配置的 `SEARCH_API_URL`，并在 `SEARCH_API_KEY` 设置密钥。密钥不会发送到 Android 或模型。
+- `web_search(query, freshness)` 用于天气、金价以外的网络搜索。默认适配 [Brave Search API](https://api.search.brave.com/app/documentation/web-search/get-started)，调用服务端配置的 `SEARCH_API_URL`，必须在 `SEARCH_API_KEY` 设置密钥；密钥不会发送到 Android 或模型。
 
 网络请求只在服务端执行，默认超时 8 秒，并按查询缓存短时间结果，避免重复请求。接口超时、无结果或返回格式异常时，模型会收到可朗读的错误信息。用户没有提供城市且未设置默认城市时，模型会先追问城市。
 
@@ -112,7 +112,7 @@ SEARCH_API_KEY=
 DEFAULT_WEATHER_CITY=
 ```
 
-API 地址和响应格式由服务端适配器处理；更换数据源时请确认接口返回城市、时间、天气或价格等字段。不要把 API 密钥写入源码、工具描述、提交记录或 Android 配置。
+API 地址和响应格式由服务端适配器处理；更换数据源时请确认接口返回城市、时间、天气或价格等字段。更换通用搜索地址时，应使用与 Brave Web Search 响应兼容的接口。不要把 API 密钥写入源码、工具描述、提交记录或 Android 配置。
 
 ## 描述眼前景象
 
