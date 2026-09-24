@@ -37,16 +37,13 @@ internal class VoiceClient(
     private val context: Context,
     private val onStatus: (String) -> Unit,
     private val onUserText: (String, String) -> Unit,
-    private val onAssistantText: (String, String) -> Unit
+    private val onAssistantText: (String, String) -> Unit,
+    private val config: VoiceClientConfig = VoiceClientConfig(),
+    private val userIdStore: UserIdStore = SharedPreferencesUserIdStore(context)
 ) {
     /** WebSocket 传输客户端；每个会话只创建一个连接。 */
     private val http = OkHttpClient()
-    private val userId: String by lazy {
-        val preferences = context.getSharedPreferences("voice_assistant", Context.MODE_PRIVATE)
-        preferences.getString("user_id", null) ?: UUID.randomUUID().toString().also {
-            preferences.edit().putString("user_id", it).apply()
-        }
-    }
+    private val userId: String by lazy { userIdStore.getOrCreate() }
     @Volatile private var session: Session? = null
 
     /** 停掉旧会话后创建新 Session，避免旧回调继续触碰新资源。 */
@@ -116,7 +113,7 @@ internal class VoiceClient(
             player?.play()
             playbackThread = thread(name = "voice-playback") { playbackLoop() }
             onStatus("连接本地服务…")
-            socket = http.newWebSocket(Request.Builder().url("ws://192.168.0.2:8000/ws/realtime").build(),
+            socket = http.newWebSocket(Request.Builder().url(config.webSocketUrl).build(),
                 object : WebSocketListener() {
                     override fun onOpen(webSocket: WebSocket, response: Response) {
                         synchronized(stateLock) {

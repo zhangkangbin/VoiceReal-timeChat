@@ -4,6 +4,9 @@ __pycache__/
 .env
 .idea/
 .tools/
+*.log
+_artifact_work/
+android/local.properties
 server/data/
 android-*.png
 android/.gradle/

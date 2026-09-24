@@ -29,22 +29,26 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
 
+from .config import Settings
 from .memory import DEFAULT_USER_ID, MemoryService, memory_service
+from .realtime_session import LocalRealtimeSession
 from .tools import TOOL_DEFINITIONS, execute_tool, realtime_tool_definitions, tool_names
 
 # 从 server/.env（如果存在）读取本地开发配置；显式设置的环境变量仍由 dotenv
 # 的默认行为保留。下面的常量在模块导入时确定，便于每个请求使用一致的配置。
 load_dotenv()
+settings = Settings.from_env()
 app = FastAPI(title="Local Realtime Voice Chat Server", version="0.2.0")
 # 测试网页与 API 进程一起提供，避免手机或浏览器测试时还要启动第二个静态服务。
 TEST_PAGE = (Path(__file__).with_name("test_page.html")).read_text(encoding="utf-8")
-WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
-WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
-WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
-MAX_HISTORY_TURNS = max(1, int(os.getenv("MAX_HISTORY_TURNS", "30")))
-MAX_TOOL_CALL_ROUNDS = max(1, int(os.getenv("MAX_TOOL_CALL_ROUNDS", "3")))
-FUNCTION_CALLS_ENABLED = os.getenv("FUNCTION_CALLS_ENABLED", "true").lower() not in {"0", "false", "no", "off"}
-MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "true").lower() not in {"0", "false", "no", "off"}
+WHISPER_MODEL = settings.whisper_model
+WHISPER_DEVICE = settings.whisper_device
+WHISPER_BEAM_SIZE = settings.whisper_beam_size
+MAX_HISTORY_TURNS = settings.max_history_turns
+MAX_AUDIO_BUFFER_BYTES = settings.max_audio_buffer_bytes
+MAX_TOOL_CALL_ROUNDS = settings.max_tool_call_rounds
+FUNCTION_CALLS_ENABLED = settings.function_calls_enabled
+MEMORY_ENABLED = settings.memory_enabled
 # 当前异步回合的上下文（用户 ID、回合 ID、召回的记忆）。ContextVar 能让并发
 # WebSocket 回合各自看到自己的值，不需要把上下文层层添加到所有函数签名中。
 _turn_context: ContextVar[dict] = ContextVar("turn_context", default={})
@@ -500,60 +504,21 @@ async def realtime(websocket: WebSocket):
         except WebSocketDisconnect:
             pass
         return
-    pcm_buffer = bytearray()
-    history: list[dict] = []
-    user_id = DEFAULT_USER_ID
-    turn_index = 0
-    current_turn_task: asyncio.Task | None = None
-    current_turn_id: str | None = None
 
-    async def cancel_current_turn(notify: bool = True):
-        """取消当前回合并可选地通知客户端；重复调用是安全的。"""
-        nonlocal current_turn_task, current_turn_id
-        task = current_turn_task
-        turn_id = current_turn_id
-        if task is not None and not task.done():
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-        # The response may already be sent but still queued on the phone.
-        if notify and turn_id is not None:
-            await send_event(websocket, send_lock, {"type": "response.cancelled", "turn_id": turn_id})
-        current_turn_task = None
-        current_turn_id = None
+    async def send_local_event(payload: dict) -> None:
+        """把会话状态机产生的事件绑定到当前 WebSocket 发送锁。"""
+        await send_event(websocket, send_lock, payload)
 
-    try:
-        while True:
-            event = json.loads(await websocket.receive_text())
-            event_type = event.get("type")
-            if event_type == "input_audio_buffer.append":
-                pcm_buffer.extend(base64.b64decode(event.get("audio", "")))
-            elif event_type == "input_audio_buffer.speech_started":
-                # Barge-in: a new speech segment interrupts the current local
-                # STT/LLM/TTS turn while the receive loop keeps accepting audio.
-                await cancel_current_turn()
-                pcm_buffer.clear()
-            elif event_type == "input_audio_buffer.clear":
-                pcm_buffer.clear()
-            elif event_type == "response.cancel":
-                await cancel_current_turn()
-            elif event_type == "input_audio_buffer.commit":
-                pcm = bytes(pcm_buffer); pcm_buffer.clear()
-                turn_index += 1
-                # Echo the client's ID so it can reject late frames from a
-                # cancelled response without waiting for an acknowledgement.
-                turn_id = str(event.get("turn_id") or f"turn-{turn_index}")[:128]
-                await cancel_current_turn(notify=False)
-                current_turn_id = turn_id
-                current_turn_task = asyncio.create_task(local_turn(websocket, send_lock, pcm, turn_id, history, user_id))
-            elif event_type == "session.update":
-                requested_user_id = str(event.get("user_id") or "").strip()
-                if requested_user_id:
-                    if requested_user_id[:128] != user_id:
-                        history.clear()
-                    user_id = requested_user_id[:128]
-                await send_event(websocket, send_lock, {"type": "session.updated", "provider": "local"})
-    except WebSocketDisconnect:
-        pass
-    finally:
-        await cancel_current_turn(notify=False)
+    async def run_local_turn(pcm: bytes, turn_id: str, history: list[dict], user_id: str) -> None:
+        """注入本地回合处理器，保留入口层的可替换依赖以支持测试和运行时配置。"""
+        await local_turn(websocket, send_lock, pcm, turn_id, history, user_id)
+
+    session = LocalRealtimeSession(
+        websocket,
+        send_local_event,
+        run_local_turn,
+        default_user_id=DEFAULT_USER_ID,
+        max_history_turns=MAX_HISTORY_TURNS,
+        max_audio_buffer_bytes=MAX_AUDIO_BUFFER_BYTES,
+    )
+    await session.run()
