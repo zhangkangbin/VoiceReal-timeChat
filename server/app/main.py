@@ -1,3 +1,12 @@
+"""本地实时语音聊天服务的入口模块。
+
+本模块把 Android 客户端（或测试网页）的 WebSocket 音频流连接到本机的
+Silero/VAD 之后的语音转写、LM Studio 对话模型和 Windows SAPI 语音合成链路。
+默认的 `lmstudio` 模式完全在局域网内工作；配置为 `openai` 时，则把事件转发
+给 OpenAI Realtime API。除了 HTTP 健康检查和测试接口外，绝大多数状态都限定在
+单条 WebSocket 会话中，以便不同用户的历史记录、记忆和正在播放的回合互不串扰。
+"""
+
 import asyncio
 import audioop
 import base64
@@ -23,8 +32,11 @@ from fastapi.responses import HTMLResponse, Response
 from .memory import DEFAULT_USER_ID, MemoryService, memory_service
 from .tools import TOOL_DEFINITIONS, execute_tool, realtime_tool_definitions, tool_names
 
+# 从 server/.env（如果存在）读取本地开发配置；显式设置的环境变量仍由 dotenv
+# 的默认行为保留。下面的常量在模块导入时确定，便于每个请求使用一致的配置。
 load_dotenv()
 app = FastAPI(title="Local Realtime Voice Chat Server", version="0.2.0")
+# 测试网页与 API 进程一起提供，避免手机或浏览器测试时还要启动第二个静态服务。
 TEST_PAGE = (Path(__file__).with_name("test_page.html")).read_text(encoding="utf-8")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "medium")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda")
@@ -33,6 +45,8 @@ MAX_HISTORY_TURNS = max(1, int(os.getenv("MAX_HISTORY_TURNS", "30")))
 MAX_TOOL_CALL_ROUNDS = max(1, int(os.getenv("MAX_TOOL_CALL_ROUNDS", "3")))
 FUNCTION_CALLS_ENABLED = os.getenv("FUNCTION_CALLS_ENABLED", "true").lower() not in {"0", "false", "no", "off"}
 MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "true").lower() not in {"0", "false", "no", "off"}
+# 当前异步回合的上下文（用户 ID、回合 ID、召回的记忆）。ContextVar 能让并发
+# WebSocket 回合各自看到自己的值，不需要把上下文层层添加到所有函数签名中。
 _turn_context: ContextVar[dict] = ContextVar("turn_context", default={})
 _whisper = None
 _cuda_dll_handles = []
@@ -42,7 +56,13 @@ _stt_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="local-stt"
 
 
 def configure_cuda_runtime() -> None:
-    """Make CUDA DLLs installed by NVIDIA's pip wheels visible on Windows."""
+    """把 pip 安装的 NVIDIA CUDA DLL 加入 Windows 进程的动态库搜索路径。
+
+    faster-whisper 通过 CTranslate2 加载 CUDA 运行时。Windows 不一定会自动在
+    Python 虚拟环境的 site-packages 中搜索这些 DLL，因此第一次转写前扫描 NVIDIA
+    wheel 的 ``bin`` 目录并保存句柄。句柄必须一直保留到进程结束，否则 Python 可能
+    过早卸载 DLL；重复调用则通过 ``_cuda_dll_handles`` 直接返回。
+    """
     if os.name != "nt" or _cuda_dll_handles:
         return
     nvidia_root = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
@@ -55,23 +75,34 @@ def configure_cuda_runtime() -> None:
 
 
 def provider_name() -> str:
+    """返回当前语音服务使用的上游提供方名称（默认是本地 LM Studio）。"""
     return os.getenv("AI_PROVIDER", "lmstudio").lower()
 
 
 @app.get("/health")
 async def health():
+    """返回服务和模型加载状态，供启动脚本、测试页和人工排障使用。
+
+    该接口不触发模型加载，只报告 Whisper 是否已经按需初始化、当前 AI 提供方、
+    可用工具以及会话历史/记忆等关键开关。
+    """
     whisper_engine = getattr(_whisper, "model", None)
     return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE, "max_history_turns": MAX_HISTORY_TURNS, "function_calls_enabled": FUNCTION_CALLS_ENABLED, "memory_enabled": MEMORY_ENABLED, "memory_user_id": DEFAULT_USER_ID, "tools": tool_names(), "whisper_loaded": _whisper is not None, "whisper_device": getattr(whisper_engine, "device", None), "whisper_compute_type": getattr(whisper_engine, "compute_type", None)}
 
 
 @app.get("/", response_class=HTMLResponse)
 async def test_page():
+    """返回内置 WebSocket 测试页的 HTML 内容。"""
     return HTMLResponse(TEST_PAGE)
 
 
 @app.get("/api/test-default-audio")
 async def test_default_audio():
-    """Return a generated Chinese test utterance as a playable WAV file."""
+    """生成一段固定的中文测试语句并以 24 kHz 单声道 WAV 返回。
+
+    合成过程放到线程中，避免 Windows SAPI 的同步调用阻塞 FastAPI 事件循环；返回
+    WAV 头则让浏览器可以直接播放，同时仍与客户端发送的 PCM 采样率约定一致。
+    """
     pcm = await asyncio.to_thread(synthesize_sapi, "请介绍一下你自己，并说一句本地测试成功")
     output = io.BytesIO()
     with wave.open(output, "wb") as wav:
@@ -84,6 +115,12 @@ async def test_default_audio():
 
 @app.post("/api/local-chat")
 async def local_chat(payload: dict):
+    """处理测试网页的非流式文本对话请求。
+
+    请求先检查用户的显式记忆命令，再召回相关记忆并调用 LM Studio；模型调用结束后
+    才提取本轮明确陈述的事实。这样“记住/忘记/查看”命令不会被模型误改写，也不会把
+    本轮新产生的记忆提前混入同一轮的提示词。
+    """
     prompt = str(payload.get("prompt", "")).strip()
     if not prompt:
         return {"reply": "请输入测试内容"}
@@ -110,6 +147,13 @@ async def local_chat(payload: dict):
 
 
 def transcribe_pcm(pcm: bytes) -> str:
+    """把 16 kHz、单声道、16-bit little-endian PCM 转写为中文文本。
+
+    Whisper 模型采用惰性初始化，并优先使用配置的 CUDA；加载或推理失败时自动
+    回退到 CPU int8。临时 WAV 明确描述 Android 的原始 PCM 格式，转写完成后无论
+    成功或失败都会删除。调用者通过单线程执行器调用本函数，以免 GPU 上出现并发
+    CTranslate2 作业。
+    """
     global _whisper
     if not pcm:
         return ""
@@ -129,6 +173,7 @@ def transcribe_pcm(pcm: bytes) -> str:
         with wave.open(path, "wb") as wav:
             wav.setnchannels(1); wav.setsampwidth(2); wav.setframerate(16000); wav.writeframes(pcm)
         def run_transcription(model):
+            """执行一次具体模型转写；参数是已初始化的 Whisper 实例。"""
             # Android already performs client-side VAD. Skipping a second VAD
             # pass reduces the time from commit to transcript.
             segments, _ = model.transcribe(
@@ -157,6 +202,13 @@ def transcribe_pcm(pcm: bytes) -> str:
 
 
 async def ask_lmstudio(text: str, history: list[dict] | None = None) -> str:
+    """调用 OpenAI-compatible 的 LM Studio Chat Completions 接口。
+
+    ``history`` 只传入最近的会话轮次；系统提示包含召回的长期记忆。模型可以返回
+    一个或多个工具调用，本函数会逐个执行并把 JSON 结果追加回消息列表，直到模型
+    产生最终文本或达到 ``MAX_TOOL_CALL_ROUNDS``。部分本地模型虽然暴露兼容接口却
+    不支持 ``tools``，收到 400 时会在当前请求中降级为普通聊天。
+    """
     url = os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1").rstrip("/") + "/chat/completions"
     turn_context = _turn_context.get({})
     system_prompt = "你是一个自然、简洁、友好的中文语音助手。回答适合直接朗读，不要使用 Markdown。请记住本次会话中用户告诉你的信息，并在后续问题中使用这些信息。如果用户询问当前时间，请调用 get_current_time，不要猜测时间。"
@@ -220,6 +272,12 @@ async def ask_lmstudio(text: str, history: list[dict] | None = None) -> str:
 
 
 def synthesize_sapi(text: str) -> bytes:
+    """使用 Windows SAPI 将文本合成为 24 kHz、单声道、16-bit PCM。
+
+    System.Speech 只能写入 WAV 文件，因此先在临时目录中生成文件，再读取帧并在
+    采样率不符合协议时用 ``audioop.ratecv`` 重采样。函数只返回裸 PCM，调用者负责
+    按 WebSocket 音频事件分块和 Base64 编码。
+    """
     with tempfile.TemporaryDirectory() as directory:
         wav_path = os.path.join(directory, "reply.wav")
         script = ("Add-Type -AssemblyName System.Speech; $s=New-Object System.Speech.Synthesis.SpeechSynthesizer; "
@@ -238,12 +296,24 @@ def synthesize_sapi(text: str) -> bytes:
 
 
 async def send_event(websocket: WebSocket, send_lock: asyncio.Lock, payload: dict):
+    """在统一发送锁内发送一条 JSON 事件。
+
+    STT、LLM/TTS 回合和上游 OpenAI 转发可能同时产生活动；锁保证多个协程不会把
+    JSON 帧交错写入同一连接，也保留客户端可依赖的事件顺序。
+    """
     async with send_lock:
         await websocket.send_json(payload)
 
 
 async def local_turn(websocket: WebSocket, send_lock: asyncio.Lock, pcm: bytes, turn_id: str,
                      history: list[dict], user_id: str = DEFAULT_USER_ID):
+    """完成本地模式的一整个回合：转写、记忆/模型处理、合成并发送音频。
+
+    该协程由 ``realtime`` 为每次 commit 创建。取消它会停止尚未发送的后续阶段；
+    底层 Whisper 原生调用本身无法被 asyncio 立即终止，但单线程执行器会保证旧任务
+    完成后才运行下一次转写。所有事件都带同一个 ``turn_id``，手机因此能丢弃迟到的
+    已取消回合数据。
+    """
     started = time.perf_counter()
     print(f"local turn start: {len(pcm)} bytes", flush=True)
     try:
@@ -300,7 +370,12 @@ async def local_turn(websocket: WebSocket, send_lock: asyncio.Lock, pcm: bytes, 
 
 
 def realtime_function_call(event: dict) -> tuple[str, str, str] | None:
-    """Extract a completed Realtime function call from either event shape."""
+    """从两种 Realtime 事件格式中提取已完成的工具调用。
+
+    不同版本/代理可能发送 ``response.function_call_arguments.done``，或把函数调用
+    包装在 ``response.output_item.done`` 中。统一返回调用 ID、函数名和 JSON 参数，
+    未识别或缺字段时返回 ``None``，让普通音频/文本事件原样转发。
+    """
     if event.get("type") == "response.function_call_arguments.done":
         call_id = str(event.get("call_id") or "")
         name = str(event.get("name") or "")
@@ -317,6 +392,12 @@ def realtime_function_call(event: dict) -> tuple[str, str, str] | None:
 
 
 async def openai_relay(client: WebSocket, send_lock: asyncio.Lock):
+    """在客户端 WebSocket 与 OpenAI Realtime WebSocket 之间转发事件。
+
+    上行协程负责把 Android 的音频和会话设置送给 OpenAI，下行协程负责向客户端回传
+    音频/文本并拦截函数调用。工具由本服务执行，再以 ``function_call_output`` 回送
+    上游；任一方向结束后取消另一方向，避免连接泄漏。
+    """
     url = "wss://api.openai.com/v1/realtime?model=" + os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
     headers = {"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}", "OpenAI-Beta": "realtime=v1"}
     async with websockets.connect(url, additional_headers=headers, max_size=None) as upstream:
@@ -340,6 +421,7 @@ async def openai_relay(client: WebSocket, send_lock: asyncio.Lock):
             session["tool_choice"] = "auto"
         await upstream.send(json.dumps({"type": "session.update", "session": session}))
         async def android_to_openai():
+            """读取客户端事件，注入本地用户 ID 的记忆上下文后转发给上游。"""
             nonlocal user_id
             while True:
                 raw_event = await client.receive_text()
@@ -364,6 +446,7 @@ async def openai_relay(client: WebSocket, send_lock: asyncio.Lock):
                 await upstream.send(json.dumps(event))
 
         async def openai_to_android():
+            """转发上游事件，并对每个函数调用 ID 至多执行一次本地工具。"""
             handled_calls: set[str] = set()
             async for message in upstream:
                 try:
@@ -400,6 +483,13 @@ async def openai_relay(client: WebSocket, send_lock: asyncio.Lock):
 
 @app.websocket("/ws/realtime")
 async def realtime(websocket: WebSocket):
+    """处理一条实时语音 WebSocket 会话。
+
+    本地模式维护输入 PCM 缓冲区、会话历史和当前任务。客户端检测到说话开始时
+    触发 barge-in，立即取消旧回合并清空缓冲；commit 则复制当前 PCM、分配唯一
+    回合 ID 并启动 ``local_turn``。会话结束时无论是正常断开还是异常断开，都会
+    取消仍在运行的回合，防止后台继续生成或向已关闭连接写入数据。
+    """
     await websocket.accept()
     mode = provider_name()
     send_lock = asyncio.Lock()
@@ -418,6 +508,7 @@ async def realtime(websocket: WebSocket):
     current_turn_id: str | None = None
 
     async def cancel_current_turn(notify: bool = True):
+        """取消当前回合并可选地通知客户端；重复调用是安全的。"""
         nonlocal current_turn_task, current_turn_id
         task = current_turn_task
         turn_id = current_turn_id

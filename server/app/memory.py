@@ -1,4 +1,8 @@
-"""Local, user-controlled long-term memory for the voice assistant."""
+"""语音助手的本地长期记忆模块。
+
+记忆以 SQLite 保存，按用户隔离，并通过置信度、重要性、过期时间和软删除
+控制可见性；服务层提供异步包装，便于在事件循环中安全调用数据库操作。
+"""
 
 from __future__ import annotations
 
@@ -22,11 +26,13 @@ MAX_MEMORY_VALUE_LENGTH = 500
 
 
 def _now() -> str:
+    """返回 UTC 当前时间的 ISO-8601 秒级字符串，供记录时间字段使用。"""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 @dataclass(frozen=True)
 class Memory:
+    """一条长期记忆的只读数据对象，对应数据库中的活动记录。"""
     id: int
     user_id: str
     type: str
@@ -40,6 +46,7 @@ class Memory:
     expires_at: str | None
 
     def as_dict(self) -> dict[str, Any]:
+        """转换为可直接返回给工具调用方的 JSON 兼容字典。"""
         return {
             "id": self.id,
             "type": self.type,
@@ -54,9 +61,14 @@ class Memory:
 
 
 class MemoryStore:
-    """SQLite persistence with one connection per operation."""
+    """SQLite 持久化实现；每次操作独立建立连接并在结束时提交或回滚。"""
 
     def __init__(self, path: str | Path | None = None):
+        """创建存储对象并初始化数据库文件。
+
+        未显式传入路径时使用 ``MEMORY_DB_PATH``，再回退到 server/data/memory.db；
+        自动创建父目录让首次启动无需额外的数据库准备步骤。
+        """
         default_path = Path(__file__).resolve().parents[1] / "data" / "memory.db"
         self.path = Path(path or os.getenv("MEMORY_DB_PATH", str(default_path)))
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -64,6 +76,7 @@ class MemoryStore:
 
     @contextmanager
     def _connect(self):
+        """提供事务连接上下文，异常时回滚，离开上下文后关闭连接。"""
         connection = sqlite3.connect(str(self.path), timeout=10)
         connection.row_factory = sqlite3.Row
         try:
@@ -76,6 +89,7 @@ class MemoryStore:
             connection.close()
 
     def _initialize(self) -> None:
+        """创建记忆表及索引；使用 IF NOT EXISTS 保证重复初始化安全。"""
         with self._connect() as connection:
             connection.executescript(
                 """
@@ -102,6 +116,7 @@ class MemoryStore:
 
     @staticmethod
     def _from_row(row: sqlite3.Row) -> Memory:
+        """把 SQLite 行映射为类型安全的 ``Memory`` 数据对象。"""
         return Memory(
             id=row["id"], user_id=row["user_id"], type=row["type"],
             key=row["key"], value=row["value"], confidence=row["confidence"],
@@ -122,6 +137,7 @@ class MemoryStore:
         source_turn_id: str | None = None,
         expires_at: str | None = None,
     ) -> Memory:
+        """同步保存或更新记忆，并按用户、类型和键去重。"""
         user_id = (user_id or DEFAULT_USER_ID).strip()[:128]
         memory_type = (memory_type or "fact").strip()[:64]
         key = (key or "fact").strip()[:128]
@@ -166,6 +182,7 @@ class MemoryStore:
         return self._from_row(saved)
 
     def list_sync(self, user_id: str, limit: int = 50) -> list[Memory]:
+        """列出用户当前未过期的活动记忆，按重要性和更新时间排序。"""
         now = _now()
         with self._connect() as connection:
             rows = connection.execute(
@@ -177,12 +194,14 @@ class MemoryStore:
         return [self._from_row(row) for row in rows]
 
     def relevant_sync(self, user_id: str, query: str, limit: int = 8) -> list[Memory]:
+        """按查询词与键/内容的匹配度筛选相关记忆。"""
         memories = self.list_sync(user_id, limit=100)
         query = (query or "").lower()
         if not query:
             return memories[:limit]
 
         def score(memory: Memory) -> tuple[int, float, str]:
+            """为单条记忆计算匹配分、重要性和更新时间排序键。"""
             haystack = f"{memory.key} {memory.value}".lower()
             exact = 4 if memory.key.lower() in query or memory.value.lower() in query else 0
             terms = [term for term in re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]{2,}", query) if len(term) >= 2]
@@ -193,6 +212,7 @@ class MemoryStore:
 
     def delete_sync(self, user_id: str, *, memory_id: int | None = None, query: str | None = None,
                     clear_all: bool = False) -> int:
+        """软删除指定、匹配或全部记忆，并返回本次标记的行数。"""
         user_id = user_id or DEFAULT_USER_ID
         with self._connect() as connection:
             if clear_all:
@@ -219,31 +239,37 @@ class MemoryStore:
 
 
 class MemoryService:
+    """异步记忆服务，将阻塞式 SQLite 调用转移到线程池。"""
     def __init__(self, store: MemoryStore | None = None):
+        """注入可测试的存储实现；未注入时使用默认 SQLite 存储。"""
         self.store = store or MemoryStore()
 
     async def save(self, user_id: str, memory_type: str, key: str, value: str, *,
                    source_turn_id: str | None = None, confidence: float = 0.85,
                    importance: float = 0.6) -> Memory:
+        """在线程中保存一条记忆，避免同步 SQLite 阻塞事件循环。"""
         return await asyncio.to_thread(
             self.store.save_sync, user_id, memory_type, key, value,
             source_turn_id=source_turn_id, confidence=confidence, importance=importance,
         )
 
     async def list(self, user_id: str, limit: int = 50) -> list[Memory]:
+        """异步列出用户当前可见的活动记忆。"""
         return await asyncio.to_thread(self.store.list_sync, user_id, limit)
 
     async def relevant(self, user_id: str, query: str, limit: int = 8) -> list[Memory]:
+        """异步召回与查询文本最相关的记忆。"""
         return await asyncio.to_thread(self.store.relevant_sync, user_id, query, limit)
 
     async def delete(self, user_id: str, *, memory_id: int | None = None,
                      query: str | None = None, clear_all: bool = False) -> int:
+        """异步执行软删除，并返回实际标记为 deleted 的记录数。"""
         return await asyncio.to_thread(
             self.store.delete_sync, user_id, memory_id=memory_id, query=query, clear_all=clear_all,
         )
 
     async def extract_explicit(self, user_id: str, text: str, source_turn_id: str | None = None) -> list[Memory]:
-        """Save only clearly expressed preferences and habits.
+        """仅保存用户明确表达的偏好、习惯或稳定要求。
 
         This deterministic fallback keeps memory useful even when a local
         model does not support tool calls. Casual statements such as "今天想
@@ -270,7 +296,7 @@ class MemoryService:
         return []
 
     async def handle_explicit_command(self, user_id: str, text: str, source_turn_id: str | None = None) -> dict[str, Any] | None:
-        """Handle deterministic memory commands before asking the model."""
+        """在请求模型前确定性处理查看、保存、删除和清空记忆命令。"""
         statement = _clean_statement(text)
         if not statement:
             return None
@@ -298,6 +324,7 @@ class MemoryService:
 
     @staticmethod
     def prompt_context(memories: list[Memory]) -> str:
+        """将相关记忆格式化为注入模型提示词的上下文文本。"""
         if not memories:
             return ""
         lines = ["用户长期记忆（仅在与当前问题相关时使用，不要主动暴露记忆来源）："]
@@ -306,14 +333,17 @@ class MemoryService:
 
 
 def _clean_statement(text: str) -> str:
+    """清理输入两端空白及常见中文标点。"""
     return str(text or "").strip().strip(" \t\r\n，。！？!?,.;；")
 
 
 def _is_memory_command(statement: str) -> bool:
+    """判断文本是否像记忆管理命令，避免把命令当作偏好保存。"""
     return bool(re.match(r"^(?:请)?(?:记住|记一下|忘记|删除|清除|查看|列出|你记得)", statement))
 
 
 def _format_memories(memories: list[Memory]) -> str:
+    """把记忆列表拼成面向用户的简短中文回复。"""
     if not memories:
         return "我目前还没有保存长期记忆。"
     return "我目前记得：" + "；".join(memory.value for memory in memories[:20]) + "。"
@@ -323,6 +353,7 @@ memory_service = MemoryService()
 
 
 async def memory_save_tool(arguments: dict[str, Any]) -> dict[str, Any]:
+    """执行模型请求的记忆保存工具，并使用服务端上下文确定用户身份。"""
     context = arguments.pop("__context", {})
     user_id = context.get("user_id", DEFAULT_USER_ID)
     memory = await memory_service.save(
@@ -338,6 +369,7 @@ async def memory_save_tool(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 async def memory_delete_tool(arguments: dict[str, Any]) -> dict[str, Any]:
+    """执行记忆删除工具，支持按关键词删除或清空全部记忆。"""
     context = arguments.pop("__context", {})
     count = await memory_service.delete(
         context.get("user_id", DEFAULT_USER_ID),
@@ -348,6 +380,7 @@ async def memory_delete_tool(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 async def memory_list_tool(arguments: dict[str, Any]) -> dict[str, Any]:
+    """执行记忆列表工具，返回序列化记忆及数量。"""
     context = arguments.pop("__context", {})
     memories = await memory_service.list(context.get("user_id", DEFAULT_USER_ID), limit=20)
     return {"memories": [memory.as_dict() for memory in memories], "count": len(memories)}

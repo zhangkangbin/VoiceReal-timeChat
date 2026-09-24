@@ -1,3 +1,8 @@
+<!--
+  本页面是本地语音链路的人工测试入口：把浏览器录到或预置的 PCM 音频发送给
+  WebSocket 服务，再把 Whisper、语言模型和 SAPI 的结果展示出来。
+  下面的注释只解释页面结构、状态和协议交互，不改变任何 HTML/CSS/JavaScript 行为。
+-->
 <!doctype html>
 <html lang="zh-CN">
 <head>
@@ -5,15 +10,20 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>本地语音链路测试</title>
   <style>
+    /* 全局视觉基线：使用系统字体，并声明浅色配色以便在本地测试时保持稳定。 */
     :root { color-scheme: light; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+    /* 页面容器和背景；宽度限制便于同时查看识别文本、指标和音频控件。 */
     body { max-width: 900px; margin: 0 auto; padding: 28px 18px 56px; color: #172033; background: #f7f8fb; }
+    /* 标题、说明文字和卡片构成页面的三个主要层次。 */
     h1 { margin: 0 0 8px; font-size: 28px; }
     h2 { margin: 0 0 10px; font-size: 20px; }
     .sub { color: #5d6677; margin: 0 0 22px; }
     .card { background: white; border: 1px solid #e2e6ee; border-radius: 14px; padding: 18px; margin: 14px 0; box-shadow: 0 3px 14px #15213b0d; }
+    /* 交互控件样式：secondary 用于“新建会话”等辅助动作，disabled 表示请求进行中。 */
     button { border: 0; border-radius: 9px; padding: 10px 15px; margin: 5px 8px 5px 0; font-size: 15px; cursor: pointer; background: #2563eb; color: white; }
     button.secondary { background: #e8eefc; color: #1d4ed8; }
     button:disabled { opacity: .5; cursor: not-allowed; }
+    /* 音频播放器、状态文本以及耗时指标的布局。 */
     audio { width: 100%; margin-top: 8px; }
     #status { color: #475569; }
     #status.ok { color: #15803d; }
@@ -27,15 +37,18 @@
   </style>
 </head>
 <body>
+  <!-- 顶部状态区：显示健康检查结果及当前后端模型/供应商信息。 -->
   <h1>本地语音链路测试</h1>
   <p class="sub">测试路径：语音 → Whisper 转文字 → LM Studio 回答 → SAPI 返回语音。数据只发送到当前服务。</p>
 
   <section class="card">
+    <!-- 健康检查完成后，status 和 modelInfo 会由 checkHealth() 更新。 -->
     <div id="status">正在连接服务…</div>
     <div class="hint" id="modelInfo"></div>
   </section>
 
   <section class="card">
+    <!-- 默认语音由服务端提供，便于在没有麦克风或需要重复测试时复现同一输入。 -->
     <h2>默认语音</h2>
     <p>默认内容：<span id="defaultText">请介绍一下你自己，并说一句本地测试成功</span></p>
     <audio id="defaultAudio" controls preload="none" src="/api/test-default-audio"></audio>
@@ -44,6 +57,7 @@
   </section>
 
   <section class="card">
+    <!-- 麦克风区把浏览器采集到的 Float32 音频转为 16 kHz、16-bit、单声道 PCM。 -->
     <h2>麦克风语音</h2>
     <button id="recordBtn" onclick="toggleRecording()">开始录音</button>
     <button class="secondary" id="stopBtn" onclick="stopRecording()" disabled>停止并测试</button>
@@ -51,6 +65,7 @@
   </section>
 
   <section class="card">
+    <!-- 结果区展示服务端事件中的转写、文本和音频；音频流会先缓存再组成 WAV。 -->
     <h2>识别与回答</h2>
     <div class="hint">识别文字</div><pre id="transcript">尚未测试</pre>
     <div class="hint">大模型回答</div><pre id="reply">尚未测试</pre>
@@ -58,6 +73,7 @@
   </section>
 
   <section class="card">
+    <!-- 指标区按提交时刻划分阶段，帮助定位上传、STT、LLM 和 TTS 的耗时。 -->
     <h2>耗时</h2>
     <div class="grid">
       <div class="metric"><label>音频上传</label><strong id="uploadMs">—</strong></div>
@@ -69,11 +85,19 @@
   </section>
 
   <script>
+    // WebSocket 与录音状态。recorded 保存 ScriptProcessor 回调得到的 Float32 分片，
+    // inputRate 记录浏览器实际采样率，停止录音时再统一重采样到服务端约定的 16 kHz。
     let socket, recording = false, audioContext, source, processor, inputStream, recorded = [], inputRate = 48000;
+    // 简短的 DOM 查询和高精度计时工具；计时值只用于页面指标展示。
     const $ = id => document.getElementById(id);
     const stamp = () => performance.now();
+    // 根据当前页面协议拼出同源 WebSocket 地址，避免硬编码主机或端口。
     const wsUrl = () => `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/realtime`;
 
+    /**
+     * 调用 HTTP 健康检查接口，显示服务是否可用及实际加载的模型。
+     * 失败时只更新页面状态，不阻止用户稍后再次点击测试按钮。
+     */
     async function checkHealth() {
       try {
         const r = await fetch('/health'), x = await r.json();
@@ -82,6 +106,11 @@
       } catch (e) { $('status').textContent = '服务不可用：' + e.message; $('status').className = 'err'; }
     }
 
+    /**
+     * 建立一次可复用的 WebSocket 连接。
+     * 服务端发送 server.ready 后 Promise 才完成；若连接已经打开则直接复用，
+     * 这样同一页面的连续回合可以保留服务端会话上下文。
+     */
     function connect() {
       if (socket && socket.readyState === WebSocket.OPEN) return Promise.resolve();
       return new Promise((resolve, reject) => {
@@ -91,17 +120,23 @@
       });
     }
 
+    /** 将 Uint8Array 分段转成 Base64，分段可避免一次性展开超大数组导致调用栈过深。 */
     function b64(bytes) {
       let s = ''; for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
       return btoa(s);
     }
 
+    /** 将 [-1, 1] 范围的 Float32 样本量化为服务端使用的 little-endian PCM16 字节。 */
     function pcm16(samples) {
       const out = new Int16Array(samples.length);
       for (let i = 0; i < samples.length; i++) out[i] = Math.max(-1, Math.min(1, samples[i])) * 32767;
       return new Uint8Array(out.buffer);
     }
 
+    /**
+     * 使用线性插值把浏览器采样率转换为目标采样率。
+     * 预置 WAV 和麦克风输入最终都统一为 16000 Hz，便于 Whisper 处理。
+     */
     function downsample(input, fromRate, toRate) {
       if (fromRate === toRate) return input;
       const ratio = fromRate / toRate, output = new Float32Array(Math.round(input.length / ratio));
@@ -112,6 +147,7 @@
       return output;
     }
 
+    /** 下载并解码预置 WAV，混合多声道后转成 16 kHz PCM16。 */
     async function wavToPcm16(url) {
       const data = await (await fetch(url)).arrayBuffer(), ctx = new AudioContext(), buffer = await ctx.decodeAudioData(data);
       const mono = new Float32Array(buffer.length);
@@ -122,11 +158,17 @@
       await ctx.close(); return pcm16(downsample(mono, buffer.sampleRate, 16000));
     }
 
+    /** 清空上一次结果并显示当前回合正在进行的阶段提示。 */
     function clearResult() {
       $('transcript').textContent = '识别中…'; $('reply').textContent = '等待模型回答…';
       ['uploadMs','sttMs','llmMs','ttsMs','totalMs'].forEach(id => $(id).textContent = '—');
     }
 
+    /**
+     * 把一段 PCM 音频按协议分片上传并提交一个回合。
+     * 每次提交都会生成带时间戳的 turn_id，服务端随后在转写、文本、音频和错误事件中
+     * 原样回传该 ID；页面据此把本次事件归入当前测试回合，并缓存音频增量等待播放。
+     */
     async function sendPcm(pcm, label) {
       clearResult(); $('status').textContent = label + '：连接中…'; $('status').className = '';
       await connect();
@@ -134,6 +176,8 @@
       const audioParts = [];
       socket.onmessage = e => {
         const msg = JSON.parse(e.data), now = stamp();
+        // 事件顺序通常是 transcript → text.done → audio.delta* → audio.done。
+        // audio.done 到达后才拼接并播放完整 WAV，同时结算分阶段耗时。
         if (msg.type === 'conversation.transcript') { transcriptAt = now; $('transcript').textContent = msg.text || '(空)'; }
         else if (msg.type === 'response.text.done') { textAt = now; $('reply').textContent = msg.text || ''; }
         else if (msg.type === 'response.audio.delta') {
@@ -144,8 +188,11 @@
           doneAt = now; finishMetrics(); playReply(audioParts); $('status').textContent = '测试完成：' + label + '（会话上下文已保留）'; $('status').className = 'ok';
         } else if (msg.type === 'error') { $('status').textContent = '测试失败：' + msg.message; $('status').className = 'err'; socket.close(); }
       };
+      // 4800 字节只是测试页的上传分片大小；每片都使用 append，全部发送后再 commit。
       for (let offset = 0; offset < pcm.length; offset += 4800) socket.send(JSON.stringify({type:'input_audio_buffer.append', audio:b64(pcm.subarray(offset, offset + 4800))}));
       appendDone = stamp(); commitAt = stamp(); socket.send(JSON.stringify({type:'input_audio_buffer.commit', turn_id:'web-' + Date.now()}));
+      // 指标按照客户端观测的阶段边界计算，不参与协议控制。
+      /** 将各阶段时间戳换算为毫秒并更新页面指标；缺失阶段显示短横线。 */
       function finishMetrics() {
         const fmt = x => x == null ? '—' : `${x.toFixed(0)} ms`;
         $('uploadMs').textContent = fmt(appendDone - t0); $('sttMs').textContent = fmt(transcriptAt - commitAt);
@@ -153,6 +200,7 @@
       }
     }
 
+    /** 把服务端返回的多个 PCM16 增量拼成可播放的 24 kHz 单声道 WAV Blob URL。 */
     function wavBlob(parts) {
       const length = parts.reduce((n, p) => n + p.length, 0), data = new Uint8Array(length); let pos = 0;
       for (const p of parts) { data.set(p, pos); pos += p.length; }
@@ -161,8 +209,11 @@
       return URL.createObjectURL(new Blob([header, data], {type:'audio/wav'}));
     }
 
+    /** 在结果区挂载并尝试自动播放本回合的音频；浏览器策略禁止自动播放时静默失败。 */
     function playReply(parts) { if (parts.length) { $('replyAudio').src = wavBlob(parts); $('replyAudio').play().catch(() => {}); } }
+    /** 关闭现有连接，让服务端创建新的会话上下文。 */
     function resetSession() { if (socket) socket.close(); socket = null; $('status').textContent = '已新建会话，历史上下文已清空'; $('status').className = 'ok'; }
+    /** 获取服务端预置音频并走与麦克风相同的上传/回合处理路径。 */
     async function runDefault() {
       $('defaultBtn').disabled = true;
       try { await sendPcm(await wavToPcm16('/api/test-default-audio'), '默认语音'); }
@@ -170,6 +221,11 @@
       finally { $('defaultBtn').disabled = false; }
     }
 
+    /**
+     * 请求麦克风并用 ScriptProcessor 收集单声道 Float32 分片。
+     * 静音增益节点把处理器接入输出图但将音量置零，避免测试回放产生啸叫；
+     * 真正的音频仅写入 recorded，停止时由 stopRecording() 汇总。
+     */
     async function toggleRecording() {
       if (recording) return;
       try {
@@ -181,12 +237,14 @@
       } catch (e) { $('status').textContent = '无法使用麦克风：' + e.message; $('status').className = 'err'; }
     }
 
+    /** 停止采集、释放麦克风资源，合并分片后下采样并提交一个“麦克风”回合。 */
     async function stopRecording() {
       if (!recording) return; recording = false; processor.disconnect(); source.disconnect(); inputStream.getTracks().forEach(t => t.stop()); await audioContext.close();
       const length = recorded.reduce((n, x) => n + x.length, 0), all = new Float32Array(length); let pos = 0; for (const x of recorded) { all.set(x, pos); pos += x.length; }
       $('recordBtn').disabled = false; $('stopBtn').disabled = true; $('recordState').textContent = '';
       if (all.length) await sendPcm(pcm16(downsample(all, inputRate, 16000)), '麦克风');
     }
+    // 页面加载即发起健康检查；用户仍可在检查失败后手动重试业务操作。
     checkHealth();
   </script>
 </body>

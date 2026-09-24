@@ -1,1 +1,2 @@
+<!-- Compose 内容自行绘制窗口，这里只提供一个无 ActionBar 的基础主题。 -->
 <resources><style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar" /></resources>

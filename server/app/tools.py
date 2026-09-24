@@ -1,8 +1,7 @@
-"""Application-owned function tools.
+"""应用侧拥有的函数工具及其统一执行入口。
 
-The model is allowed to request only tools registered in this module.  The
-server validates and executes the request, so API keys and private business
-logic never need to be sent to the Android client.
+模型只能请求本模块注册的工具。服务器负责校验并执行请求，因此 API 密钥和
+私有业务逻辑无需发送到 Android 客户端。
 """
 
 from __future__ import annotations
@@ -20,11 +19,11 @@ ToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
 class ToolExecutionError(RuntimeError):
-    """A safe, user-facing tool execution failure."""
+    """可安全展示给用户的工具执行失败。"""
 
 
 async def get_current_time(arguments: dict[str, Any]) -> dict[str, Any]:
-    """Return the current time for an IANA timezone."""
+    """按 IANA 时区返回当前日期、时间和星期，并提供 Windows 回退时区。"""
     timezone_name = str(arguments.get("timezone") or "Asia/Shanghai")
     try:
         timezone = ZoneInfo(timezone_name)
@@ -126,17 +125,18 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
 
 
 def realtime_tool_definitions() -> list[dict[str, Any]]:
-    """Return the flat tool shape expected by the Realtime API."""
+    """转换为 Realtime API 所需的扁平工具定义结构。"""
     return [item["function"] | {"type": item["type"]} for item in TOOL_DEFINITIONS]
 
 
 def tool_names() -> list[str]:
+    """返回已注册工具名称，供校验或日志使用。"""
     return list(TOOL_HANDLERS)
 
 
 async def execute_tool(name: str, arguments: Any, timeout_seconds: float = 10.0,
                        context: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Validate, execute, and normalize a model-requested tool call."""
+    """校验模型参数、执行工具，并把成功与失败统一为字典结果。"""
     handler = TOOL_HANDLERS.get(name)
     if handler is None:
         return {"ok": False, "error": f"未知工具：{name}"}

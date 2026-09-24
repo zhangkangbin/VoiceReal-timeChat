@@ -1,12 +1,19 @@
+# FastAPI/uvicorn 提供 HTTP、WebSocket 路由和开发服务器。
 fastapi==0.115.6
+# uvicorn[standard] 提供生产/开发启动器以及 WebSocket 所需的标准扩展。
 uvicorn[standard]==0.34.0
+# websockets 用于 OpenAI Realtime 上游转发；Android 到 FastAPI 使用 FastAPI 的实现。
 websockets==14.1
+# dotenv 读取本地 .env，tzdata 保证 Windows 也能解析 IANA 时区。
 python-dotenv==1.0.1
 tzdata>=2024.1,<2027
+# httpx 调用 LM Studio 的 OpenAI-compatible HTTP 接口。
 httpx==0.28.1
+# faster-whisper 使用 CTranslate2 执行本地中文 ASR。
 faster-whisper==1.1.1
-# Windows CUDA runtime DLLs required by faster-whisper/CTranslate2.
+# 以下三个 wheel 只在 Windows 安装，用于让 CUDA 版 CTranslate2 找到运行时库。
 nvidia-cublas-cu12==12.9.2.10; platform_system == "Windows"
 nvidia-cuda-nvrtc-cu12==12.9.86; platform_system == "Windows"
 nvidia-cudnn-cu12==9.26.0.51; platform_system == "Windows"
+# requests 是本地诊断/辅助脚本可能使用的 HTTP 客户端。
 requests==2.32.3

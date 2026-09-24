@@ -29,13 +29,17 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
-/** Continuous microphone/VAD + independent playback; all inference stays local. */
+/**
+ * 管理一次完整的实时语音会话：麦克风采集、Silero VAD、WebSocket 事件和独立播放线程。
+ * 录音上传与回复播放使用 16 kHz/24 kHz PCM16，服务端只负责会话协议，推理保持在本地。
+ */
 internal class VoiceClient(
     private val context: Context,
     private val onStatus: (String) -> Unit,
     private val onUserText: (String, String) -> Unit,
     private val onAssistantText: (String, String) -> Unit
 ) {
+    /** WebSocket 传输客户端；每个会话只创建一个连接。 */
     private val http = OkHttpClient()
     private val userId: String by lazy {
         val preferences = context.getSharedPreferences("voice_assistant", Context.MODE_PRIVATE)
@@ -45,6 +49,7 @@ internal class VoiceClient(
     }
     @Volatile private var session: Session? = null
 
+    /** 停掉旧会话后创建新 Session，避免旧回调继续触碰新资源。 */
     @Synchronized fun startSession() {
         session?.stop()
         val next = Session()
@@ -56,16 +61,18 @@ internal class VoiceClient(
         }
     }
 
+    /** 主动结束会话并恢复系统音频路由。 */
     @Synchronized fun stopSession() {
         session?.stop()
         session = null
         onStatus("已停止")
     }
 
+    /** 播放队列元素；done=true 表示该回合所有 PCM 已入队，等待播放头追上。 */
     private data class AudioChunk(val turnId: String, val pcm: ByteArray, val done: Boolean = false)
 
-    // Every session owns its threads/resources. A late callback from an old
-    // WebSocket can never start or release the next session's microphone.
+    // 每个 Session 独占线程和资源。旧 WebSocket 的迟到回调不能启动或释放新会话麦克风。
+    /** 一次会话的资源边界；所有线程、队列和回合状态都归属于该对象。 */
     private inner class Session {
         private val running = AtomicBoolean(true)
         private val stateLock = Any()
@@ -81,13 +88,17 @@ internal class VoiceClient(
         private var player: AudioTrack? = null
         private var captureThread: Thread? = null
         private var playbackThread: Thread? = null
+        /** 当前提交回合 ID；用于丢弃旧 WebSocket 音频和完成事件。 */
         private var turnId: String? = null
+        /** VAD 当前是否处于用户说话段，决定是否允许播放回复。 */
         private var userSpeaking = false
         private var playing = false
         private var writtenFrames = 0L
 
+        /** 同时检查停止标志和顶层当前会话引用，阻止旧回调修改新会话。 */
         private fun isActive() = running.get() && session === this
 
+        /** 初始化 24 kHz 播放器、建立 WebSocket，并在连接打开后启动录音。 */
         fun start() {
             configureRoute()
             val minBuffer = AudioTrack.getMinBufferSize(24000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
@@ -168,6 +179,7 @@ internal class VoiceClient(
                 })
         }
 
+        /** 切换到通信模式并优先选择扬声器，同时保留耳机等外部设备的选择。 */
         @Suppress("DEPRECATION")
         private fun configureRoute() {
             routeConfigured = true
@@ -175,7 +187,7 @@ internal class VoiceClient(
             audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
             if (Build.VERSION.SDK_INT >= 31) {
                 previousDevice = audioManager.communicationDevice
-                // Keep an external headset if selected; otherwise use speaker.
+                // 已选择耳机等外部设备时保留它；没有选择或当前是内置听筒/扬声器时切到扬声器。
                 if (previousDevice == null || previousDevice?.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE ||
                     previousDevice?.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
                     audioManager.availableCommunicationDevices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
@@ -187,6 +199,7 @@ internal class VoiceClient(
             }
         }
 
+        /** 恢复会话开始前的通信设备和 AudioManager 模式。 */
         @Suppress("DEPRECATION")
         private fun restoreRoute() {
             if (!routeConfigured) return
@@ -200,6 +213,7 @@ internal class VoiceClient(
             routeConfigured = false
         }
 
+        /** 尝试启用 AEC、降噪或自动增益；设备不支持时只记录日志并继续工作。 */
         private fun enableEffect(name: String, create: () -> AudioEffect?) {
             runCatching {
                 val effect = create()
@@ -211,6 +225,7 @@ internal class VoiceClient(
             }.onFailure { Log.w(TAG, "$name unavailable", it) }
         }
 
+        /** 创建 16 kHz PCM16 录音器，在线程中按 32 ms 帧送入 VAD。 */
         private fun startCapture() {
             check(context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                 "麦克风权限未授予"
@@ -278,15 +293,17 @@ internal class VoiceClient(
             }
         }
 
+        /** 在会话仍有效时发送一个 JSON 协议事件。 */
         private fun send(event: JSONObject) {
             if (isActive() && socket?.send(event.toString()) != true) fail("发送失败，请重新开始会话")
         }
 
+        /** 将一帧 16 kHz PCM16 编为 Base64，并追加到服务端输入缓冲区。 */
         private fun sendAudio(frame: ByteArray) = send(JSONObject().put("type", "input_audio_buffer.append")
             .put("audio", Base64.getEncoder().encodeToString(frame)))
 
-        // stateLock protects invalidation and each NON-BLOCKING write together.
-        // No old chunk can be written after the immediate pause/flush operation.
+        // stateLock 将失效处理与每次非阻塞写入放在同一临界区，确保暂停/flush 后不再写入旧块。
+        /** 立即作废当前回合并清空 AudioTrack 和待播放队列，用于抢话或取消。 */
         private fun invalidatePlayback() {
             turnId = null
             queue.clear()
@@ -297,6 +314,7 @@ internal class VoiceClient(
             player?.play()
         }
 
+        /** 非阻塞消费服务端音频；回合变化、插话或取消会立即丢弃旧块。 */
         private fun playbackLoop() {
             try {
                 while (isActive()) {
@@ -332,6 +350,7 @@ internal class VoiceClient(
             }
         }
 
+        /** 记录错误并按停止流程释放资源，再把状态反馈给界面。 */
         fun fail(message: String, error: Throwable? = null) {
             if (!isActive()) return
             Log.e(TAG, message, error)
@@ -339,6 +358,7 @@ internal class VoiceClient(
             if (session === this) onStatus(message)
         }
 
+        /** 释放音频效果和 AudioRecord；只由停止流程或采集线程收尾调用。 */
         private fun releaseCapture() {
             effects.forEach { runCatching { it.release() } }
             effects.clear()
@@ -346,6 +366,7 @@ internal class VoiceClient(
             recorder = null
         }
 
+        /** 幂等地停止线程、WebSocket、录放音设备并恢复进入会话前的路由。 */
         fun stop() {
             synchronized(stateLock) {
                 if (!running.getAndSet(false)) return
@@ -354,7 +375,7 @@ internal class VoiceClient(
                 socket?.close(1000, "session stopped")
                 socket = null
                 runCatching { recorder?.stop() }
-                // The capture thread releases its own recorder after read exits.
+                // 采集线程从阻塞 read 返回后会释放自己的 recorder，避免并发释放底层对象。
                 if (captureThread == null) releaseCapture()
                 runCatching { player?.pause(); player?.flush(); player?.release() }
                 player = null

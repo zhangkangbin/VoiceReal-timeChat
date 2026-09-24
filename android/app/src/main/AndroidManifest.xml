@@ -1,8 +1,11 @@
+<!-- 应用声明录音、音频路由和局域网 WebSocket 所需的系统权限。 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 本地开发服务使用 ws:// 明文地址，因此明确允许 cleartext 流量。 -->
     <application android:theme="@style/AppTheme" android:label="Realtime Voice Chat" android:usesCleartextTraffic="true">
+        <!-- MainActivity 是唯一入口，并允许从桌面启动。 -->
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
         </activity>

@@ -25,9 +25,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 
+/** 语音聊天界面入口：申请录音权限并把 VoiceClient 的事件映射为 Compose 状态。 */
 class MainActivity : ComponentActivity() {
+    /** 系统录音权限请求回调；结果由客户端在真正开始录音时再次校验。 */
     private val requestPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
+    /** 创建界面；先请求录音权限，再安装 Compose 内容，避免无权限直接启动采集线程。 */
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -37,6 +40,7 @@ class MainActivity : ComponentActivity() {
     }
 
     @Composable
+    /** 显示连接状态、最近消息以及开始/停止会话按钮。 */
     private fun VoiceScreen() {
         var active by remember { mutableStateOf(false) }
         var status by remember { mutableStateOf("未连接") }
@@ -61,6 +65,7 @@ class MainActivity : ComponentActivity() {
                 }
             )
         }
+        // Activity 销毁或 Compose 离开树时释放 WebSocket、录音器、播放器和 VAD 线程。
         DisposableEffect(client) {
             onDispose { client.stopSession() }
         }
@@ -96,6 +101,7 @@ class MainActivity : ComponentActivity() {
 
 }
 
+/** 根据发送方将文本显示为左右对齐、颜色不同的消息气泡。 */
 @Composable
 private fun MessageBubble(message: ChatMessage) {
     Row(
