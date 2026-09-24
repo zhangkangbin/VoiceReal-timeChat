@@ -50,7 +50,6 @@ MAX_AUDIO_BUFFER_BYTES = settings.max_audio_buffer_bytes
 MAX_TOOL_CALL_ROUNDS = settings.max_tool_call_rounds
 MAX_IMAGE_BYTES = settings.max_image_bytes
 CAMERA_TIMEOUT_SECONDS = settings.camera_timeout_seconds
-VISION_MODEL = settings.vision_model
 FUNCTION_CALLS_ENABLED = settings.function_calls_enabled
 MEMORY_ENABLED = settings.memory_enabled
 # 当前异步回合的上下文（用户 ID、回合 ID、召回的记忆）。ContextVar 能让并发
@@ -102,7 +101,7 @@ async def health():
     可用工具以及会话历史/记忆等关键开关。
     """
     whisper_engine = getattr(_whisper, "model", None)
-    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "vision_model": VISION_MODEL, "camera_capture_supported": provider_name() == "lmstudio" and FUNCTION_CALLS_ENABLED, "max_image_bytes": MAX_IMAGE_BYTES, "camera_timeout_seconds": CAMERA_TIMEOUT_SECONDS, "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE, "max_history_turns": MAX_HISTORY_TURNS, "function_calls_enabled": FUNCTION_CALLS_ENABLED, "memory_enabled": MEMORY_ENABLED, "memory_user_id": DEFAULT_USER_ID, "tools": tool_names(), "whisper_loaded": _whisper is not None, "whisper_device": getattr(whisper_engine, "device", None), "whisper_compute_type": getattr(whisper_engine, "compute_type", None)}
+    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "camera_capture_supported": provider_name() == "lmstudio" and FUNCTION_CALLS_ENABLED, "max_image_bytes": MAX_IMAGE_BYTES, "camera_timeout_seconds": CAMERA_TIMEOUT_SECONDS, "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE, "max_history_turns": MAX_HISTORY_TURNS, "function_calls_enabled": FUNCTION_CALLS_ENABLED, "memory_enabled": MEMORY_ENABLED, "memory_user_id": DEFAULT_USER_ID, "tools": tool_names(), "whisper_loaded": _whisper is not None, "whisper_device": getattr(whisper_engine, "device", None), "whisper_compute_type": getattr(whisper_engine, "compute_type", None)}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -307,7 +306,9 @@ async def analyze_image(prompt: str, image: bytes, mime_type: str = "image/jpeg"
     url = os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1").rstrip("/") + "/chat/completions"
     encoded = base64.b64encode(image).decode("ascii")
     payload = {
-        "model": VISION_MODEL,
+        # Reuse the already configured multimodal LM Studio model. The image
+        # is sent as an additional content part; no second model is introduced.
+        "model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"),
         "messages": [
             {
                 "role": "system",

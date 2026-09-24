@@ -88,13 +88,13 @@ MAX_TOOL_CALL_ROUNDS=3
 `request_camera_capture` 工具识别出拍照意图。服务端随后向 Android 发送
 `camera.capture.request`，应用申请相机权限并打开系统相机；照片以受限大小的 JPEG
 通过 `camera.capture.result` 回传。服务端把原话和照片作为多模态 Chat Completions
-请求发送给 `VISION_MODEL`，再用本地 SAPI 合成中文语音。请求始终绑定
+请求复用已配置的 `LMSTUDIO_MODEL`，再用本地 SAPI 合成中文语音。请求始终绑定
 `turn_id`/`request_id`，用户取消拍照、超时或打断时，迟到的照片会被丢弃。
 
-图片分析需要 LM Studio 中加载支持视觉输入和工具调用的模型。可在 `.env` 中设置：
+图片分析直接使用当前 LM Studio 模型；该模型需要同时支持视觉输入和工具调用。可在 `.env` 中设置：
 
 ```text
-VISION_MODEL=你的视觉模型
+LMSTUDIO_MODEL=你之前配置的多模态模型
 MAX_IMAGE_BYTES=4194304
 CAMERA_TIMEOUT_SECONDS=30
 ```

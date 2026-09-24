@@ -39,7 +39,6 @@ class Settings:
     max_tool_call_rounds: int
     max_image_bytes: int
     camera_timeout_seconds: int
-    vision_model: str
     function_calls_enabled: bool
     memory_enabled: bool
 
@@ -55,7 +54,6 @@ class Settings:
             max_tool_call_rounds=_positive_int("MAX_TOOL_CALL_ROUNDS", 3),
             max_image_bytes=_positive_int("MAX_IMAGE_BYTES", 4 * 1024 * 1024),
             camera_timeout_seconds=_positive_int("CAMERA_TIMEOUT_SECONDS", 30),
-            vision_model=os.getenv("VISION_MODEL", os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b")),
             function_calls_enabled=_bool("FUNCTION_CALLS_ENABLED", True),
             memory_enabled=_bool("MEMORY_ENABLED", True),
         )
