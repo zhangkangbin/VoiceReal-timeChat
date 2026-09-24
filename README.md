@@ -82,6 +82,38 @@ MAX_TOOL_CALL_ROUNDS=3
 
 记忆默认开启，保存到 `server/data/memory.db`；可使用 `MEMORY_ENABLED=false` 关闭。
 
+## 网络搜索、天气和金价
+
+服务端提供三个查询工具，并继续复用当前配置的 LM Studio 多模态模型和原有语音链路：
+
+```text
+用户：查询今天上海的天气
+模型：调用 get_weather(city="上海")
+服务端：访问天气接口并返回结构化结果
+模型：根据结果生成中文回答 → 现有 TTS 播放
+```
+
+- `get_weather(city)` 查询今天的天气；默认数据源是 [Open-Meteo](https://open-meteo.com/)，支持通过 `WEATHER_API_URL` 替换兼容接口。
+- `get_gold_price(currency, unit)` 查询当前金价；默认数据源是 [Gold API](https://gold-api.com/)，返回每金衡盎司价格后按请求单位换算，支持通过 `GOLD_PRICE_API_URL` 替换兼容接口。
+- `web_search(query, freshness)` 用于天气、金价以外的网络搜索。默认适配 [Brave Search API](https://api.search.brave.com/app/documentation/web-search/get-started)，调用服务端配置的 `SEARCH_API_URL`，并在 `SEARCH_API_KEY` 设置密钥。密钥不会发送到 Android 或模型。
+
+网络请求只在服务端执行，默认超时 8 秒，并按查询缓存短时间结果，避免重复请求。接口超时、无结果或返回格式异常时，模型会收到可朗读的错误信息。用户没有提供城市且未设置默认城市时，模型会先追问城市。
+
+在 `server/.env` 中按需配置：
+
+```text
+NETWORK_TIMEOUT_SECONDS=8
+NETWORK_CACHE_SECONDS=300
+WEATHER_API_URL=https://api.open-meteo.com/v1/forecast
+WEATHER_GEOCODING_URL=https://geocoding-api.open-meteo.com/v1/search
+GOLD_PRICE_API_URL=https://api.gold-api.com/price/XAU/{currency}
+SEARCH_API_URL=https://api.search.brave.com/res/v1/web/search
+SEARCH_API_KEY=
+DEFAULT_WEATHER_CITY=
+```
+
+API 地址和响应格式由服务端适配器处理；更换数据源时请确认接口返回城市、时间、天气或价格等字段。不要把 API 密钥写入源码、工具描述、提交记录或 Android 配置。
+
 ## 描述眼前景象
 
 在本地 LM Studio 模式下，用户说“描述眼前景象”时，模型会先通过
