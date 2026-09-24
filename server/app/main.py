@@ -50,6 +50,8 @@ MAX_AUDIO_BUFFER_BYTES = settings.max_audio_buffer_bytes
 MAX_TOOL_CALL_ROUNDS = settings.max_tool_call_rounds
 MAX_IMAGE_BYTES = settings.max_image_bytes
 CAMERA_TIMEOUT_SECONDS = settings.camera_timeout_seconds
+NETWORK_TIMEOUT_SECONDS = settings.network_timeout_seconds
+NETWORK_CACHE_SECONDS = settings.network_cache_seconds
 FUNCTION_CALLS_ENABLED = settings.function_calls_enabled
 MEMORY_ENABLED = settings.memory_enabled
 # 当前异步回合的上下文（用户 ID、回合 ID、召回的记忆）。ContextVar 能让并发
@@ -101,7 +103,7 @@ async def health():
     可用工具以及会话历史/记忆等关键开关。
     """
     whisper_engine = getattr(_whisper, "model", None)
-    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "camera_capture_supported": provider_name() == "lmstudio" and FUNCTION_CALLS_ENABLED, "max_image_bytes": MAX_IMAGE_BYTES, "camera_timeout_seconds": CAMERA_TIMEOUT_SECONDS, "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE, "max_history_turns": MAX_HISTORY_TURNS, "function_calls_enabled": FUNCTION_CALLS_ENABLED, "memory_enabled": MEMORY_ENABLED, "memory_user_id": DEFAULT_USER_ID, "tools": tool_names(), "whisper_loaded": _whisper is not None, "whisper_device": getattr(whisper_engine, "device", None), "whisper_compute_type": getattr(whisper_engine, "compute_type", None)}
+    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "camera_capture_supported": provider_name() == "lmstudio" and FUNCTION_CALLS_ENABLED, "max_image_bytes": MAX_IMAGE_BYTES, "camera_timeout_seconds": CAMERA_TIMEOUT_SECONDS, "network_timeout_seconds": NETWORK_TIMEOUT_SECONDS, "network_cache_seconds": NETWORK_CACHE_SECONDS, "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE, "max_history_turns": MAX_HISTORY_TURNS, "function_calls_enabled": FUNCTION_CALLS_ENABLED, "memory_enabled": MEMORY_ENABLED, "memory_user_id": DEFAULT_USER_ID, "tools": tool_names(), "whisper_loaded": _whisper is not None, "whisper_device": getattr(whisper_engine, "device", None), "whisper_compute_type": getattr(whisper_engine, "compute_type", None)}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -225,7 +227,7 @@ async def ask_lmstudio(text: str, history: list[dict] | None = None) -> str | Ca
     """
     url = os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1").rstrip("/") + "/chat/completions"
     turn_context = _turn_context.get({})
-    system_prompt = "你是一个自然、简洁、友好的中文语音助手。回答适合直接朗读，不要使用 Markdown。请记住本次会话中用户告诉你的信息，并在后续问题中使用这些信息。如果用户询问当前时间，请调用 get_current_time，不要猜测时间。"
+    system_prompt = "你是一个自然、简洁、友好的中文语音助手。回答适合直接朗读，不要使用 Markdown。请记住本次会话中用户告诉你的信息，并在后续问题中使用这些信息。如果用户询问当前时间，请调用 get_current_time，不要猜测时间。如果用户询问今天或当前天气，请调用 get_weather；询问金价或黄金价格，请调用 get_gold_price；询问其他最新事实或新闻，请调用 web_search，不要凭记忆猜测。"
     if MEMORY_ENABLED:
         system_prompt += " 如果用户明确要求记住、忘记或查看记忆，请使用 memory_save、memory_delete 或 memory_list。只有明确表达的偏好、习惯或事实才保存。"
         memory_prompt = MemoryService.prompt_context(turn_context.get("memory_context", []))
@@ -483,7 +485,7 @@ async def openai_relay(client: WebSocket, send_lock: asyncio.Lock):
     async with websockets.connect(url, additional_headers=headers, max_size=None) as upstream:
         user_id = DEFAULT_USER_ID
         memory_context = await memory_service.relevant(DEFAULT_USER_ID, "", limit=8) if MEMORY_ENABLED else []
-        instructions = "你是一个简洁、自然、友好的中文语音助手。如果用户询问当前时间，请调用 get_current_time，不要猜测时间。"
+        instructions = "你是一个简洁、自然、友好的中文语音助手。如果用户询问当前时间，请调用 get_current_time，不要猜测时间。如果用户询问今天或当前天气，请调用 get_weather；询问金价或黄金价格，请调用 get_gold_price；询问其他最新事实或新闻，请调用 web_search，不要凭记忆猜测。"
         if MEMORY_ENABLED:
             instructions += " 如果用户明确要求记住、忘记或查看记忆，请使用 memory_save、memory_delete 或 memory_list。只有明确表达的偏好、习惯或事实才保存。"
             memory_prompt = MemoryService.prompt_context(memory_context)
@@ -517,7 +519,7 @@ async def openai_relay(client: WebSocket, send_lock: asyncio.Lock):
                     # Refresh instructions with the memories for this user.
                     if MEMORY_ENABLED:
                         selected = await memory_service.relevant(user_id, "", limit=8)
-                        refreshed_instructions = "你是一个简洁、自然、友好的中文语音助手。如果用户询问当前时间，请调用 get_current_time，不要猜测时间。 如果用户明确要求记住、忘记或查看记忆，请使用 memory_save、memory_delete 或 memory_list。只有明确表达的偏好、习惯或事实才保存。"
+                        refreshed_instructions = "你是一个简洁、自然、友好的中文语音助手。如果用户询问当前时间，请调用 get_current_time，不要猜测时间。如果用户询问今天或当前天气，请调用 get_weather；询问金价或黄金价格，请调用 get_gold_price；询问其他最新事实或新闻，请调用 web_search，不要凭记忆猜测。 如果用户明确要求记住、忘记或查看记忆，请使用 memory_save、memory_delete 或 memory_list。只有明确表达的偏好、习惯或事实才保存。"
                         memory_prompt = MemoryService.prompt_context(selected)
                         if memory_prompt:
                             refreshed_instructions += "\n\n" + memory_prompt

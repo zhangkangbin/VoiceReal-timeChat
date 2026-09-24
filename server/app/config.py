@@ -27,6 +27,17 @@ def _bool(name: str, default: bool) -> bool:
     return raw.lower() not in {"0", "false", "no", "off"}
 
 
+def _non_negative_int(name: str, default: int) -> int:
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ValueError(f"{name} 必须是整数，收到 {raw!r}") from error
+    if value < 0:
+        raise ValueError(f"{name} 不能小于 0，收到 {value}")
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     """启动时解析的本地服务配置。"""
@@ -39,6 +50,8 @@ class Settings:
     max_tool_call_rounds: int
     max_image_bytes: int
     camera_timeout_seconds: int
+    network_timeout_seconds: int
+    network_cache_seconds: int
     function_calls_enabled: bool
     memory_enabled: bool
 
@@ -54,6 +67,8 @@ class Settings:
             max_tool_call_rounds=_positive_int("MAX_TOOL_CALL_ROUNDS", 3),
             max_image_bytes=_positive_int("MAX_IMAGE_BYTES", 4 * 1024 * 1024),
             camera_timeout_seconds=_positive_int("CAMERA_TIMEOUT_SECONDS", 30),
+            network_timeout_seconds=_positive_int("NETWORK_TIMEOUT_SECONDS", 8),
+            network_cache_seconds=_non_negative_int("NETWORK_CACHE_SECONDS", 300),
             function_calls_enabled=_bool("FUNCTION_CALLS_ENABLED", True),
             memory_enabled=_bool("MEMORY_ENABLED", True),
         )
