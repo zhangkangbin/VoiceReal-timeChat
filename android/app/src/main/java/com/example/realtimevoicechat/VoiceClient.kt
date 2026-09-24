@@ -3,6 +3,7 @@ package com.example.realtimevoicechat
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
@@ -23,6 +24,7 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
 import java.util.Base64
+import java.io.ByteArrayOutputStream
 import java.util.UUID
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -39,7 +41,8 @@ internal class VoiceClient(
     private val onUserText: (String, String) -> Unit,
     private val onAssistantText: (String, String) -> Unit,
     private val config: VoiceClientConfig = VoiceClientConfig(),
-    private val userIdStore: UserIdStore = SharedPreferencesUserIdStore(context)
+    private val userIdStore: UserIdStore = SharedPreferencesUserIdStore(context),
+    private val onCameraCaptureRequested: (String, String, String) -> Unit = { _, _, _ -> }
 ) {
     /** WebSocket 传输客户端；每个会话只创建一个连接。 */
     private val http = OkHttpClient()
@@ -63,6 +66,16 @@ internal class VoiceClient(
         session?.stop()
         session = null
         onStatus("已停止")
+    }
+
+    /** 将 Android 拍到的照片压缩为 JPEG，并回传给等待中的服务端回合。 */
+    fun sendCameraImage(turnId: String, requestId: String, bitmap: Bitmap) {
+        session?.sendCameraImage(turnId, requestId, bitmap)
+    }
+
+    /** 把相机权限拒绝、取消或启动失败通知服务端，解除等待中的照片请求。 */
+    fun sendCameraError(turnId: String, requestId: String, code: String, message: String) {
+        session?.sendCameraError(turnId, requestId, code, message)
     }
 
     /** 播放队列元素；done=true 表示该回合所有 PCM 已入队，等待播放头追上。 */
@@ -89,6 +102,9 @@ internal class VoiceClient(
         private var turnId: String? = null
         /** VAD 当前是否处于用户说话段，决定是否允许播放回复。 */
         private var userSpeaking = false
+        /** 相机打开期间暂停向服务端发送麦克风帧，避免环境音污染当前回合。 */
+        @Volatile private var cameraPending = false
+        @Volatile private var cameraRequestId: String? = null
         private var playing = false
         private var writtenFrames = 0L
 
@@ -134,6 +150,15 @@ internal class VoiceClient(
                             // when they arrive after a NEW utterance was committed.
                             if (id.isNotEmpty() && id != turnId) return
                             when (type) {
+                                "camera.capture.request" -> {
+                                    val requestId = event.optString("request_id")
+                                    if (requestId.isBlank() || id.isBlank()) return
+                                    cameraPending = true
+                                    cameraRequestId = requestId
+                                    invalidatePlayback(keepTurnId = true)
+                                    onStatus("请拍摄眼前景象…")
+                                    onCameraCaptureRequested(id, requestId, event.optString("reason", "describe_scene"))
+                                }
                                 "conversation.transcript" -> {
                                     val transcript = event.optString("text").trim()
                                     if (transcript.isNotEmpty()) onUserText(id, transcript)
@@ -249,6 +274,7 @@ internal class VoiceClient(
                             filled += count
                             if (filled != buffer.size) continue
                             filled = 0
+                            if (cameraPending) continue
                             // No turn-in-flight gate, cooldown, or remote reset:
                             // Silero processes EVERY frame, including during TTS.
                             val decision = vad.accept(buffer.copyOf())
@@ -299,10 +325,62 @@ internal class VoiceClient(
         private fun sendAudio(frame: ByteArray) = send(JSONObject().put("type", "input_audio_buffer.append")
             .put("audio", Base64.getEncoder().encodeToString(frame)))
 
+        /** 压缩并上传照片；较大的缩略图逐步降低质量，避免 WebSocket 消息无限膨胀。 */
+        fun sendCameraImage(expectedTurnId: String, requestId: String, bitmap: Bitmap) {
+            synchronized(stateLock) {
+                if (!isActive() || expectedTurnId != turnId || requestId != cameraRequestId) return
+                var quality = 85
+                val bytes = runCatching {
+                    var encoded: ByteArray
+                    do {
+                        val output = ByteArrayOutputStream()
+                        check(bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) { "照片压缩失败" }
+                        encoded = output.toByteArray()
+                        quality -= 10
+                    } while (encoded.size > 3_500_000 && quality >= 45)
+                    encoded
+                }.getOrElse {
+                    cameraPending = false
+                    cameraRequestId = null
+                    send(JSONObject().put("type", "camera.capture.error")
+                        .put("turn_id", expectedTurnId)
+                        .put("request_id", requestId)
+                        .put("code", "encode_failed")
+                        .put("message", "照片压缩失败"))
+                    return
+                }
+                cameraPending = false
+                cameraRequestId = null
+                send(JSONObject().put("type", "camera.capture.result")
+                    .put("turn_id", expectedTurnId)
+                    .put("request_id", requestId)
+                    .put("mime_type", "image/jpeg")
+                    .put("image_base64", Base64.getEncoder().encodeToString(bytes)))
+            }
+        }
+
+        /** 上传相机失败状态并恢复麦克风采集。 */
+        fun sendCameraError(expectedTurnId: String, requestId: String, code: String, message: String) {
+            synchronized(stateLock) {
+                if (!isActive() || expectedTurnId != turnId || requestId != cameraRequestId) return
+                cameraPending = false
+                cameraRequestId = null
+                send(JSONObject().put("type", "camera.capture.error")
+                    .put("turn_id", expectedTurnId)
+                    .put("request_id", requestId)
+                    .put("code", code)
+                    .put("message", message.take(160)))
+            }
+        }
+
         // stateLock 将失效处理与每次非阻塞写入放在同一临界区，确保暂停/flush 后不再写入旧块。
         /** 立即作废当前回合并清空 AudioTrack 和待播放队列，用于抢话或取消。 */
-        private fun invalidatePlayback() {
-            turnId = null
+        private fun invalidatePlayback(keepTurnId: Boolean = false) {
+            if (!keepTurnId) {
+                turnId = null
+                cameraPending = false
+                cameraRequestId = null
+            }
             queue.clear()
             playing = false
             player?.pause()
@@ -368,6 +446,8 @@ internal class VoiceClient(
             synchronized(stateLock) {
                 if (!running.getAndSet(false)) return
                 turnId = null
+                cameraPending = false
+                cameraRequestId = null
                 queue.clear()
                 socket?.close(1000, "session stopped")
                 socket = null

@@ -10,12 +10,21 @@ import base64
 import json
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from uuid import uuid4
 
 from fastapi import WebSocket, WebSocketDisconnect
 
 
 SendEvent = Callable[[dict], Awaitable[None]]
-TurnHandler = Callable[[bytes, str, list[dict], str], Awaitable[None]]
+TurnHandler = Callable[[bytes, str, list[dict], str, Callable[[str, str], Awaitable[dict]]], Awaitable[None]]
+
+
+class CameraCaptureError(RuntimeError):
+    """相机请求失败或客户端返回了无效照片。"""
+
+    def __init__(self, message: str, *, user_message: str | None = None):
+        super().__init__(message)
+        self.user_message = user_message or message
 
 
 class LocalRealtimeSession:
@@ -30,6 +39,8 @@ class LocalRealtimeSession:
         default_user_id: str,
         max_history_turns: int,
         max_audio_buffer_bytes: int = 5 * 1024 * 1024,
+        max_image_bytes: int = 4 * 1024 * 1024,
+        camera_timeout_seconds: int = 30,
     ) -> None:
         self.websocket = websocket
         self.send_event = send_event
@@ -37,11 +48,14 @@ class LocalRealtimeSession:
         self.user_id = default_user_id
         self.max_history_turns = max(1, max_history_turns)
         self.max_audio_buffer_bytes = max(1, max_audio_buffer_bytes)
+        self.max_image_bytes = max(1, max_image_bytes)
+        self.camera_timeout_seconds = max(1, camera_timeout_seconds)
         self.pcm_buffer = bytearray()
         self.history: list[dict] = []
         self.turn_index = 0
         self.current_turn_task: asyncio.Task | None = None
         self.current_turn_id: str | None = None
+        self.pending_camera: dict | None = None
 
     async def run(self) -> None:
         """读取并处理客户端事件，断线时保证当前回合被取消。"""
@@ -75,6 +89,10 @@ class LocalRealtimeSession:
             await self.commit(event.get("turn_id"))
         elif event_type == "session.update":
             await self.update_session(event.get("user_id"))
+        elif event_type == "camera.capture.result":
+            await self._resolve_camera(event, error=False)
+        elif event_type == "camera.capture.error":
+            await self._resolve_camera(event, error=True)
 
     def _append_audio(self, encoded_audio: str) -> None:
         """追加一帧 Base64 PCM；空值按协议视为没有新音频。"""
@@ -97,6 +115,79 @@ class LocalRealtimeSession:
             name=f"local-turn-{turn_id}",
         )
 
+    async def request_camera(self, turn_id: str, reason: str = "describe_scene") -> dict:
+        """请求 Android 拍照并等待同一回合、同一请求 ID 的结果。"""
+        if self.pending_camera is not None:
+            raise CameraCaptureError("已有相机请求正在等待")
+        request_id = f"camera-{uuid4().hex}"
+        future = asyncio.get_running_loop().create_future()
+        self.pending_camera = {"request_id": request_id, "turn_id": turn_id, "future": future}
+        try:
+            await self.send_event({
+                "type": "camera.capture.request",
+                "turn_id": turn_id,
+                "request_id": request_id,
+                "reason": reason[:80],
+                "lens": "back",
+                "max_width": 1280,
+                "max_height": 1280,
+                "quality": 85,
+            })
+            return await asyncio.wait_for(asyncio.shield(future), timeout=self.camera_timeout_seconds)
+        except asyncio.TimeoutError as error:
+            raise CameraCaptureError("相机请求超时", user_message="拍照等待超时，请重试。") from error
+        finally:
+            if not future.done():
+                future.cancel()
+            if self.pending_camera is not None and self.pending_camera.get("request_id") == request_id:
+                self.pending_camera = None
+
+    async def _resolve_camera(self, event: dict, *, error: bool) -> None:
+        """校验相机回调的回合/请求绑定，阻止迟到照片污染新回合。"""
+        pending = self.pending_camera
+        if pending is None:
+            return
+        if (str(event.get("request_id") or "") != pending["request_id"] or
+                str(event.get("turn_id") or "") != pending["turn_id"]):
+            return
+        future = pending["future"]
+        if future.done():
+            return
+        if error:
+            message = str(event.get("message") or "拍照已取消")[:200]
+            future.set_exception(CameraCaptureError(message, user_message=message))
+            return
+        mime_type = str(event.get("mime_type") or "image/jpeg").lower()
+        if mime_type not in {"image/jpeg", "image/png", "image/webp"}:
+            future.set_exception(CameraCaptureError("不支持的图片格式", user_message="照片格式不受支持，请重试。"))
+            return
+        encoded = event.get("image_base64")
+        if not isinstance(encoded, str) or not encoded:
+            future.set_exception(CameraCaptureError("照片内容为空", user_message="没有收到照片，请重试。"))
+            return
+        # Reject oversized Base64 before decoding so a malicious JSON frame cannot
+        # allocate an unbounded temporary byte string.
+        if len(encoded) > ((self.max_image_bytes * 4) // 3) + 8:
+            future.set_exception(CameraCaptureError("照片超过大小限制", user_message="照片太大，请重新拍一张。"))
+            return
+        try:
+            image = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError):
+            future.set_exception(CameraCaptureError("照片不是有效的 Base64", user_message="照片上传失败，请重试。"))
+            return
+        if not image or len(image) > self.max_image_bytes:
+            future.set_exception(CameraCaptureError("照片超过大小限制", user_message="照片太大，请重新拍一张。"))
+            return
+        future.set_result({"bytes": image, "mime_type": mime_type})
+
+    def _cancel_pending_camera(self) -> None:
+        pending = self.pending_camera
+        self.pending_camera = None
+        if pending is not None:
+            future = pending.get("future")
+            if future is not None and not future.done():
+                future.cancel()
+
     async def _run_turn(self, pcm: bytes, turn_id: str) -> None:
         """执行回合处理器。
 
@@ -104,7 +195,7 @@ class LocalRealtimeSession:
         说话仍能得到明确的 ``response.cancelled`` 确认。下一次提交或显式取消时，
         ``cancel_current_turn`` 会统一清理这两个引用。
         """
-        await self.turn_handler(pcm, turn_id, self.history, self.user_id)
+        await self.turn_handler(pcm, turn_id, self.history, self.user_id, self.request_camera)
         # 历史窗口是会话状态机的不变量；即使未来替换 turn_handler，也不会
         # 让单个连接无限增长。当前的 local_turn 仍会提前裁剪一次，这里是边界兜底。
         del self.history[:-(self.max_history_turns * 2)]
@@ -130,6 +221,7 @@ class LocalRealtimeSession:
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+        self._cancel_pending_camera()
         if notify and turn_id is not None:
             await self.send_event({"type": "response.cancelled", "turn_id": turn_id})
         self.current_turn_task = None

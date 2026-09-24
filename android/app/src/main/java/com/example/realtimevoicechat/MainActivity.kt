@@ -30,6 +30,31 @@ class MainActivity : ComponentActivity() {
     /** 系统录音权限请求回调；结果由客户端在真正开始录音时再次校验。 */
     private val requestPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
+    /** 拍照权限结果；拿到权限后立即继续当前一次模型发起的拍照请求。 */
+    private val requestCameraPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        val request = pendingCameraRequest
+        if (granted && request != null) launchCamera(request)
+        else if (!granted) {
+            pendingCameraRequest = null
+            voiceClient?.sendCameraError(request?.first.orEmpty(), request?.second.orEmpty(), "permission_denied", "没有相机权限")
+        }
+    }
+
+    /** TakePicturePreview 不把照片落盘，适合把本次照片直接压缩后上传给服务端。 */
+    private val takePicturePreview = registerForActivityResult(ActivityResultContracts.TakePicturePreview()) { bitmap ->
+        val request = pendingCameraRequest
+        pendingCameraRequest = null
+        if (request == null) return@registerForActivityResult
+        if (bitmap == null) {
+            voiceClient?.sendCameraError(request.first, request.second, "cancelled", "拍照已取消")
+        } else {
+            voiceClient?.sendCameraImage(request.first, request.second, bitmap)
+        }
+    }
+
+    private var pendingCameraRequest: Triple<String, String, String>? = null
+    private var voiceClient: VoiceClient? = null
+
     /** 创建界面；先请求录音权限，再安装 Compose 内容，避免无权限直接启动采集线程。 */
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -37,6 +62,29 @@ class MainActivity : ComponentActivity() {
             requestPermission.launch(Manifest.permission.RECORD_AUDIO)
         }
         setContent { VoiceScreen() }
+    }
+
+    /** 在主线程启动系统相机；request 中依次为 turn_id、request_id、拍照原因。 */
+    private fun launchCamera(request: Triple<String, String, String>) {
+        pendingCameraRequest = request
+        runCatching { takePicturePreview.launch(null) }
+            .onFailure {
+                pendingCameraRequest = null
+                voiceClient?.sendCameraError(request.first, request.second, "camera_unavailable", "无法打开相机")
+            }
+    }
+
+    /** 响应服务端的相机回调请求，并把系统权限/取消状态回传给同一回合。 */
+    private fun onCameraCaptureRequested(turnId: String, requestId: String, reason: String) {
+        runOnUiThread {
+            val request = Triple(turnId, requestId, reason)
+            pendingCameraRequest = request
+            if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                launchCamera(request)
+            } else {
+                requestCameraPermission.launch(Manifest.permission.CAMERA)
+            }
+        }
     }
 
     @Composable
@@ -62,9 +110,13 @@ class MainActivity : ComponentActivity() {
                             messages = (messages + ChatMessage("$turnId-assistant", ChatRole.ASSISTANT, text)).takeLast(100)
                         }
                     }
+                },
+                onCameraCaptureRequested = { turnId, requestId, reason ->
+                    onCameraCaptureRequested(turnId, requestId, reason)
                 }
             )
         }
+        LaunchedEffect(client) { voiceClient = client }
         // Activity 销毁或 Compose 离开树时释放 WebSocket、录音器、播放器和 VAD 线程。
         DisposableEffect(client) {
             onDispose { client.stopSession() }

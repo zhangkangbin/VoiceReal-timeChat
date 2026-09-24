@@ -22,6 +22,7 @@ import wave
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from contextlib import suppress
+from dataclasses import dataclass
 
 import httpx
 import websockets
@@ -31,7 +32,7 @@ from fastapi.responses import HTMLResponse, Response
 
 from .config import Settings
 from .memory import DEFAULT_USER_ID, MemoryService, memory_service
-from .realtime_session import LocalRealtimeSession
+from .realtime_session import CameraCaptureError, LocalRealtimeSession
 from .tools import TOOL_DEFINITIONS, execute_tool, realtime_tool_definitions, tool_names
 
 # 从 server/.env（如果存在）读取本地开发配置；显式设置的环境变量仍由 dotenv
@@ -47,6 +48,9 @@ WHISPER_BEAM_SIZE = settings.whisper_beam_size
 MAX_HISTORY_TURNS = settings.max_history_turns
 MAX_AUDIO_BUFFER_BYTES = settings.max_audio_buffer_bytes
 MAX_TOOL_CALL_ROUNDS = settings.max_tool_call_rounds
+MAX_IMAGE_BYTES = settings.max_image_bytes
+CAMERA_TIMEOUT_SECONDS = settings.camera_timeout_seconds
+VISION_MODEL = settings.vision_model
 FUNCTION_CALLS_ENABLED = settings.function_calls_enabled
 MEMORY_ENABLED = settings.memory_enabled
 # 当前异步回合的上下文（用户 ID、回合 ID、召回的记忆）。ContextVar 能让并发
@@ -57,6 +61,13 @@ _cuda_dll_handles = []
 # Cancelling an asyncio task cannot stop a running CTranslate2 call. Keep
 # serialization in the worker, so a cancelled job never overlaps the next one.
 _stt_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="local-stt")
+
+
+@dataclass(frozen=True, slots=True)
+class CameraCaptureIntent:
+    """模型通过工具调用表达的拍照意图；实际拍照由 Android 执行。"""
+
+    reason: str = "describe_scene"
 
 
 def configure_cuda_runtime() -> None:
@@ -91,7 +102,7 @@ async def health():
     可用工具以及会话历史/记忆等关键开关。
     """
     whisper_engine = getattr(_whisper, "model", None)
-    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE, "max_history_turns": MAX_HISTORY_TURNS, "function_calls_enabled": FUNCTION_CALLS_ENABLED, "memory_enabled": MEMORY_ENABLED, "memory_user_id": DEFAULT_USER_ID, "tools": tool_names(), "whisper_loaded": _whisper is not None, "whisper_device": getattr(whisper_engine, "device", None), "whisper_compute_type": getattr(whisper_engine, "compute_type", None)}
+    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "vision_model": VISION_MODEL, "camera_capture_supported": provider_name() == "lmstudio" and FUNCTION_CALLS_ENABLED, "max_image_bytes": MAX_IMAGE_BYTES, "camera_timeout_seconds": CAMERA_TIMEOUT_SECONDS, "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE, "max_history_turns": MAX_HISTORY_TURNS, "function_calls_enabled": FUNCTION_CALLS_ENABLED, "memory_enabled": MEMORY_ENABLED, "memory_user_id": DEFAULT_USER_ID, "tools": tool_names(), "whisper_loaded": _whisper is not None, "whisper_device": getattr(whisper_engine, "device", None), "whisper_compute_type": getattr(whisper_engine, "compute_type", None)}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -205,7 +216,7 @@ def transcribe_pcm(pcm: bytes) -> str:
             os.remove(path)
 
 
-async def ask_lmstudio(text: str, history: list[dict] | None = None) -> str:
+async def ask_lmstudio(text: str, history: list[dict] | None = None) -> str | CameraCaptureIntent:
     """调用 OpenAI-compatible 的 LM Studio Chat Completions 接口。
 
     ``history`` 只传入最近的会话轮次；系统提示包含召回的长期记忆。模型可以返回
@@ -226,13 +237,15 @@ async def ask_lmstudio(text: str, history: list[dict] | None = None) -> str:
         messages.extend(history[-(MAX_HISTORY_TURNS * 2):])
     messages.append({"role": "user", "content": text})
     tools_enabled = FUNCTION_CALLS_ENABLED
+    camera_intent_enabled = bool(turn_context.get("camera_intent_enabled"))
     async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
         for tool_round in range(MAX_TOOL_CALL_ROUNDS + 1):
             payload = {"model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "messages": messages, "stream": False, "temperature": 0.3, "max_tokens": 128}
             if tools_enabled:
                 available_tools = [
                     tool for tool in TOOL_DEFINITIONS
-                    if MEMORY_ENABLED or not tool["function"]["name"].startswith("memory_")
+                    if (MEMORY_ENABLED or not tool["function"]["name"].startswith("memory_"))
+                    and (camera_intent_enabled or tool["function"]["name"] != "request_camera_capture")
                 ]
                 payload["tools"] = available_tools
                 payload["tool_choice"] = "auto"
@@ -265,6 +278,16 @@ async def ask_lmstudio(text: str, history: list[dict] | None = None) -> str:
                 function = call.get("function") or {}
                 name = str(function.get("name") or "")
                 arguments = function.get("arguments") or "{}"
+                if name == "request_camera_capture" and camera_intent_enabled:
+                    try:
+                        parsed_arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+                    except json.JSONDecodeError:
+                        parsed_arguments = {}
+                    reason = str((parsed_arguments or {}).get("reason") or "describe_scene")[:80]
+                    # The asynchronous phone callback is handled by the session;
+                    # returning this marker keeps the camera tool out of the
+                    # ordinary synchronous tool-result loop.
+                    return CameraCaptureIntent(reason=reason)
                 result = await execute_tool(name, arguments, context=turn_context)
                 print(f"function call: {name} -> {result.get('ok')}", flush=True)
                 messages.append({
@@ -273,6 +296,48 @@ async def ask_lmstudio(text: str, history: list[dict] | None = None) -> str:
                     "content": json.dumps(result, ensure_ascii=False),
                 })
         return "抱歉，暂时无法完成这个请求。"
+
+
+async def analyze_image(prompt: str, image: bytes, mime_type: str = "image/jpeg") -> str:
+    """把手机照片和用户原话发送给支持视觉的 Chat Completions 模型。"""
+    if not image or len(image) > MAX_IMAGE_BYTES:
+        raise CameraCaptureError("图片为空或超过大小限制", user_message="照片太大或没有拍到，请重试。")
+    if mime_type not in {"image/jpeg", "image/png", "image/webp"}:
+        raise CameraCaptureError("不支持的图片类型", user_message="照片格式不受支持，请重试。")
+    url = os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1").rstrip("/") + "/chat/completions"
+    encoded = base64.b64encode(image).decode("ascii")
+    payload = {
+        "model": VISION_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是一个中文视觉助手。请根据照片回答用户的问题，先说明看见的主要物体、人物、文字和环境，再补充与问题相关的细节。只输出适合直接朗读的简洁中文，不要使用 Markdown；看不清时明确说明。",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt or "请描述眼前的景象。"},
+                    {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{encoded}"}},
+                ],
+            },
+        ],
+        "stream": False,
+        "temperature": 0.2,
+        "max_tokens": 256,
+    }
+    async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
+        try:
+            response = await client.post(url, json=payload)
+            response.raise_for_status()
+        except httpx.HTTPError as error:
+            raise CameraCaptureError("视觉模型请求失败", user_message="照片分析服务暂时不可用，请稍后再试。") from error
+    try:
+        reply = str(response.json()["choices"][0]["message"].get("content") or "").strip()
+    except (KeyError, IndexError, TypeError, ValueError) as error:
+        raise CameraCaptureError("视觉模型返回格式无效", user_message="照片分析没有返回有效结果，请重试。") from error
+    if not reply:
+        raise CameraCaptureError("视觉模型返回空结果", user_message="我暂时看不清照片，请重新拍一张。")
+    return reply
 
 
 def synthesize_sapi(text: str) -> bytes:
@@ -310,7 +375,8 @@ async def send_event(websocket: WebSocket, send_lock: asyncio.Lock, payload: dic
 
 
 async def local_turn(websocket: WebSocket, send_lock: asyncio.Lock, pcm: bytes, turn_id: str,
-                     history: list[dict], user_id: str = DEFAULT_USER_ID):
+                     history: list[dict], user_id: str = DEFAULT_USER_ID,
+                     request_camera=None):
     """完成本地模式的一整个回合：转写、记忆/模型处理、合成并发送音频。
 
     该协程由 ``realtime`` 为每次 commit 创建。取消它会停止尚未发送的后续阶段；
@@ -338,6 +404,7 @@ async def local_turn(websocket: WebSocket, send_lock: asyncio.Lock, pcm: bytes, 
                 "user_id": user_id,
                 "turn_id": turn_id,
                 "memory_context": memories,
+                "camera_intent_enabled": request_camera is not None,
             })
             try:
                 # Keep the first-turn call compatible with simple provider adapters;
@@ -345,6 +412,14 @@ async def local_turn(websocket: WebSocket, send_lock: asyncio.Lock, pcm: bytes, 
                 reply = await ask_lmstudio(text, history) if history else await ask_lmstudio(text)
             finally:
                 _turn_context.reset(token)
+            if isinstance(reply, CameraCaptureIntent):
+                if request_camera is None:
+                    raise CameraCaptureError("当前会话不支持相机拍照", user_message="当前连接不支持拍照，请使用本地模式。")
+                try:
+                    photo = await request_camera(turn_id, reply.reason)
+                    reply = await analyze_image(text, photo["bytes"], photo.get("mime_type", "image/jpeg"))
+                except CameraCaptureError as error:
+                    reply = error.user_message
             if MEMORY_ENABLED:
                 await memory_service.extract_explicit(user_id, text, turn_id)
         history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": reply}])
@@ -420,7 +495,8 @@ async def openai_relay(client: WebSocket, send_lock: asyncio.Lock):
         if FUNCTION_CALLS_ENABLED:
             session["tools"] = [
                 tool for tool in realtime_tool_definitions()
-                if MEMORY_ENABLED or not tool["name"].startswith("memory_")
+                if (MEMORY_ENABLED or not tool["name"].startswith("memory_"))
+                and tool["name"] != "request_camera_capture"
             ]
             session["tool_choice"] = "auto"
         await upstream.send(json.dumps({"type": "session.update", "session": session}))
@@ -509,9 +585,9 @@ async def realtime(websocket: WebSocket):
         """把会话状态机产生的事件绑定到当前 WebSocket 发送锁。"""
         await send_event(websocket, send_lock, payload)
 
-    async def run_local_turn(pcm: bytes, turn_id: str, history: list[dict], user_id: str) -> None:
+    async def run_local_turn(pcm: bytes, turn_id: str, history: list[dict], user_id: str, request_camera) -> None:
         """注入本地回合处理器，保留入口层的可替换依赖以支持测试和运行时配置。"""
-        await local_turn(websocket, send_lock, pcm, turn_id, history, user_id)
+        await local_turn(websocket, send_lock, pcm, turn_id, history, user_id, request_camera)
 
     session = LocalRealtimeSession(
         websocket,
@@ -520,5 +596,7 @@ async def realtime(websocket: WebSocket):
         default_user_id=DEFAULT_USER_ID,
         max_history_turns=MAX_HISTORY_TURNS,
         max_audio_buffer_bytes=MAX_AUDIO_BUFFER_BYTES,
+        max_image_bytes=MAX_IMAGE_BYTES,
+        camera_timeout_seconds=CAMERA_TIMEOUT_SECONDS,
     )
     await session.run()

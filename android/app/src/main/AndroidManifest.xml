@@ -1,6 +1,7 @@
 <!-- 应用声明录音、音频路由和局域网 WebSocket 所需的系统权限。 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.INTERNET" />
     <!-- 本地开发服务使用 ws:// 明文地址，因此明确允许 cleartext 流量。 -->

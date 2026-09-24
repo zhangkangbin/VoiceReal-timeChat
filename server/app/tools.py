@@ -54,6 +54,23 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "request_camera_capture",
+            "description": "当用户要求描述眼前、面前或相机看到的景象时，请求手机后置相机拍照。只在用户明确需要看现场画面时调用。拍照完成后服务端会继续分析照片并用语音回答。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "拍照原因，例如 describe_scene。",
+                    }
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_current_time",
             "description": "查询指定时区的当前日期和时间。用户询问现在几点、今天日期时使用。",
             "parameters": {
