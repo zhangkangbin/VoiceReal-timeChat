@@ -76,7 +76,7 @@ class FullDuplexTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "provider_name", return_value="lmstudio"),
             patch.object(main, "transcribe_pcm", return_value="测试语音"),
             patch.object(main, "ask_lmstudio", new=AsyncMock(return_value="本地回答")),
-            patch.object(main, "synthesize_sapi", return_value=b"\0" * 9600),
+            patch.object(main, "synthesize_audio", return_value=b"\0" * 9600),
         ]
         for item in self.patches:
             item.start()
@@ -217,7 +217,7 @@ class FullDuplexTests(unittest.IsolatedAsyncioTestCase):
             loop.call_soon_threadsafe(finished.set)
             return b"\0" * 9600
 
-        with patch.object(main, "synthesize_sapi", side_effect=delayed_tts):
+        with patch.object(main, "synthesize_audio", side_effect=delayed_tts):
             try:
                 await self.commit("cancelled-tts")
                 await asyncio.wait_for(started.wait(), 3)

@@ -8,6 +8,7 @@ __pycache__/
 _artifact_work/
 android/local.properties
 server/data/
+server/models/
 android-*.png
 android/.gradle/
 android/build/

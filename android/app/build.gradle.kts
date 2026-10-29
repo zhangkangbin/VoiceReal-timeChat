@@ -9,6 +9,12 @@ android { namespace = "com.example.realtimevoicechat"; compileSdk = 35
     // 项目使用 Java 17 的 API/字节码目标，需与本地 Android Studio JDK 保持一致。
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlinOptions { jvmTarget = "17" }
+    // Python and Android ship the same runtime catalog; do not maintain two alias lists.
+    sourceSets.getByName("main").assets.srcDir("../../server/app/expressions/assets")
+    testOptions.unitTests.all {
+        it.systemProperty("expressionCatalogPath", file("../../server/app/expressions/assets/expressions.v1.json").absolutePath)
+        it.systemProperty("expressionExamplesPath", file("../../docs/expression-mapping/mapping-examples.v1.json").absolutePath)
+    }
 }
 
 // UI、协程、网络和本地 ONNX Runtime 依赖；AAR 直接放在 app/libs 目录中，
@@ -22,4 +28,6 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation(files("libs/onnxruntime-android-1.19.2.aar"))
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 }

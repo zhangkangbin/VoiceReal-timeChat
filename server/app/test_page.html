@@ -34,6 +34,7 @@
     .metric strong { display: block; font-size: 20px; margin-top: 4px; }
     pre { white-space: pre-wrap; background: #f8fafc; border-radius: 10px; padding: 13px; min-height: 42px; margin: 8px 0 0; }
     .hint { color: #64748b; font-size: 13px; }
+    input { box-sizing: border-box; max-width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 8px; font: inherit; }
   </style>
 </head>
 <body>
@@ -69,7 +70,19 @@
     <h2>识别与回答</h2>
     <div class="hint">识别文字</div><pre id="transcript">尚未测试</pre>
     <div class="hint">大模型回答</div><pre id="reply">尚未测试</pre>
+    <div class="hint">本轮表情</div><pre id="replyExpression">尚未匹配</pre>
     <div class="hint">返回语音</div><audio id="replyAudio" controls></audio>
+  </section>
+
+  <section class="card">
+    <h2>表情词匹配</h2>
+    <p class="hint">输入一个表情词，如“狂喜”“哈哈”“心碎”。此项独立于语音和大模型。</p>
+    <form id="expressionForm">
+      <label for="expressionWord">表情词</label>
+      <input id="expressionWord" name="word" value="狂喜" maxlength="64" required>
+      <button id="expressionBtn" type="submit">匹配表情</button>
+    </form>
+    <pre id="expressionResult" aria-live="polite">等待测试</pre>
   </section>
 
   <section class="card">
@@ -93,6 +106,28 @@
     const stamp = () => performance.now();
     // 根据当前页面协议拼出同源 WebSocket 地址，避免硬编码主机或端口。
     const wsUrl = () => `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/realtime`;
+    let activeTurnId = null;
+
+    function expressionLabel(result) {
+      if (!result) return '未提供表情';
+      if (result.status === 'MATCH') return result.name || result.expression_id;
+      return result.status === 'INVALID_INPUT' ? '请输入一个明确的表情词' : '未匹配到明确表情';
+    }
+
+    $('expressionForm').addEventListener('submit', async event => {
+      event.preventDefault();
+      $('expressionBtn').disabled = true;
+      try {
+        const response = await fetch('/api/expressions/match', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({word: $('expressionWord').value})
+        });
+        if (!response.ok) throw new Error('匹配服务暂时不可用');
+        const result = await response.json();
+        $('expressionResult').textContent = expressionLabel(result);
+      } catch (error) { $('expressionResult').textContent = error.message; }
+      finally { $('expressionBtn').disabled = false; }
+    });
 
     /**
      * 调用 HTTP 健康检查接口，显示服务是否可用及实际加载的模型。
@@ -161,6 +196,7 @@
     /** 清空上一次结果并显示当前回合正在进行的阶段提示。 */
     function clearResult() {
       $('transcript').textContent = '识别中…'; $('reply').textContent = '等待模型回答…';
+      $('replyExpression').textContent = '等待表情…';
       ['uploadMs','sttMs','llmMs','ttsMs','totalMs'].forEach(id => $(id).textContent = '—');
     }
 
@@ -172,14 +208,22 @@
     async function sendPcm(pcm, label) {
       clearResult(); $('status').textContent = label + '：连接中…'; $('status').className = '';
       await connect();
+      const currentSocket = socket;
+      const turnId = 'web-' + (globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      activeTurnId = turnId;
       const t0 = stamp(); let appendDone, commitAt, transcriptAt, textAt, firstAudioAt, doneAt;
       const audioParts = [];
       socket.onmessage = e => {
         const msg = JSON.parse(e.data), now = stamp();
+        if (socket !== currentSocket || activeTurnId !== turnId) return;
+        if (msg.turn_id && msg.turn_id !== turnId) return;
         // 事件顺序通常是 transcript → text.done → audio.delta* → audio.done。
         // audio.done 到达后才拼接并播放完整 WAV，同时结算分阶段耗时。
         if (msg.type === 'conversation.transcript') { transcriptAt = now; $('transcript').textContent = msg.text || '(空)'; }
-        else if (msg.type === 'response.text.done') { textAt = now; $('reply').textContent = msg.text || ''; }
+        else if (msg.type === 'response.text.done') {
+          textAt = now; $('reply').textContent = msg.text || '';
+          if (msg.turn_id === turnId) $('replyExpression').textContent = expressionLabel(msg.expression);
+        }
         else if (msg.type === 'response.audio.delta') {
           if (!firstAudioAt) firstAudioAt = now;
           const raw = atob(msg.delta), bytes = new Uint8Array(raw.length);
@@ -190,7 +234,7 @@
       };
       // 4800 字节只是测试页的上传分片大小；每片都使用 append，全部发送后再 commit。
       for (let offset = 0; offset < pcm.length; offset += 4800) socket.send(JSON.stringify({type:'input_audio_buffer.append', audio:b64(pcm.subarray(offset, offset + 4800))}));
-      appendDone = stamp(); commitAt = stamp(); socket.send(JSON.stringify({type:'input_audio_buffer.commit', turn_id:'web-' + Date.now()}));
+      appendDone = stamp(); commitAt = stamp(); socket.send(JSON.stringify({type:'input_audio_buffer.commit', turn_id:turnId}));
       // 指标按照客户端观测的阶段边界计算，不参与协议控制。
       /** 将各阶段时间戳换算为毫秒并更新页面指标；缺失阶段显示短横线。 */
       function finishMetrics() {
@@ -212,7 +256,7 @@
     /** 在结果区挂载并尝试自动播放本回合的音频；浏览器策略禁止自动播放时静默失败。 */
     function playReply(parts) { if (parts.length) { $('replyAudio').src = wavBlob(parts); $('replyAudio').play().catch(() => {}); } }
     /** 关闭现有连接，让服务端创建新的会话上下文。 */
-    function resetSession() { if (socket) socket.close(); socket = null; $('status').textContent = '已新建会话，历史上下文已清空'; $('status').className = 'ok'; }
+    function resetSession() { activeTurnId = null; if (socket) socket.close(); socket = null; $('replyExpression').textContent = '尚未匹配'; $('status').textContent = '已新建会话，历史上下文已清空'; $('status').className = 'ok'; }
     /** 获取服务端预置音频并走与麦克风相同的上传/回合处理路径。 */
     async function runDefault() {
       $('defaultBtn').disabled = true;

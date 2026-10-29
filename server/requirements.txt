@@ -11,6 +11,8 @@ tzdata>=2024.1,<2027
 httpx==0.28.1
 # faster-whisper 使用 CTranslate2 执行本地中文 ASR。
 faster-whisper==1.1.1
+# sherpa-onnx 提供可离线运行的中文 VITS 神经 TTS；模型文件由 setup_neural_tts.ps1 单独下载。
+sherpa-onnx==1.13.8
 # 以下三个 wheel 只在 Windows 安装，用于让 CUDA 版 CTranslate2 找到运行时库。
 nvidia-cublas-cu12==12.9.2.10; platform_system == "Windows"
 nvidia-cuda-nvrtc-cu12==12.9.86; platform_system == "Windows"

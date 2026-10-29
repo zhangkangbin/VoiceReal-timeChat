@@ -23,6 +23,9 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
+import com.example.realtimevoicechat.expression.Expression
+import com.example.realtimevoicechat.expression.ExpressionEventResolver
+import com.example.realtimevoicechat.expression.ExpressionMatcher
 import java.util.Base64
 import java.io.ByteArrayOutputStream
 import java.util.UUID
@@ -39,7 +42,7 @@ internal class VoiceClient(
     private val context: Context,
     private val onStatus: (String) -> Unit,
     private val onUserText: (String, String) -> Unit,
-    private val onAssistantText: (String, String) -> Unit,
+    private val onAssistantText: (String, String, Expression?) -> Unit,
     private val config: VoiceClientConfig = VoiceClientConfig(),
     private val userIdStore: UserIdStore = SharedPreferencesUserIdStore(context),
     private val onCameraCaptureRequested: (String, String, String) -> Unit = { _, _, _ -> }
@@ -47,6 +50,13 @@ internal class VoiceClient(
     /** WebSocket 传输客户端；每个会话只创建一个连接。 */
     private val http = OkHttpClient()
     private val userId: String by lazy { userIdStore.getOrCreate() }
+    private val expressionResolver: ExpressionEventResolver? by lazy {
+        runCatching {
+            context.assets.open(ExpressionMatcher.ASSET_NAME).bufferedReader(Charsets.UTF_8).use {
+                ExpressionEventResolver(ExpressionMatcher.fromJson(it.readText()))
+            }
+        }.onFailure { Log.e(TAG, "Expression catalog could not be loaded", it) }.getOrNull()
+    }
     @Volatile private var session: Session? = null
 
     /** 停掉旧会话后创建新 Session，避免旧回调继续触碰新资源。 */
@@ -166,7 +176,11 @@ internal class VoiceClient(
                                 }
                                 "response.text.done" -> {
                                     val reply = event.optString("text").trim()
-                                    if (reply.isNotEmpty()) onAssistantText(id, reply)
+                                    // Always match locally, ignoring any server-selected expression ID.
+                                    val expression = expressionResolver?.resolve(
+                                        event.opt("expression_word"), id, turnId, userSpeaking
+                                    )
+                                    if (reply.isNotEmpty()) onAssistantText(id, reply, expression)
                                     onStatus("正在生成语音…")
                                 }
                                 "response.audio.delta" -> {

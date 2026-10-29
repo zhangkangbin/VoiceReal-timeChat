@@ -104,10 +104,10 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 },
-                onAssistantText = { turnId, text ->
+                onAssistantText = { turnId, text, expression ->
                     runOnUiThread {
                         if (text.isNotBlank()) {
-                            messages = (messages + ChatMessage("$turnId-assistant", ChatRole.ASSISTANT, text)).takeLast(100)
+                            messages = (messages + ChatMessage("$turnId-assistant", ChatRole.ASSISTANT, text, expression)).takeLast(100)
                         }
                     }
                 },
@@ -182,6 +182,19 @@ private fun MessageBubble(message: ChatMessage) {
                     modifier = Modifier.padding(top = 4.dp),
                     style = MaterialTheme.typography.bodyLarge
                 )
+                message.expression?.takeIf { message.role == ChatRole.ASSISTANT }?.let { expression ->
+                    Surface(
+                        modifier = Modifier.padding(top = 8.dp),
+                        shape = MaterialTheme.shapes.small,
+                        color = MaterialTheme.colorScheme.secondaryContainer
+                    ) {
+                        Text(
+                            text = "表情：${expression.name}",
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                    }
+                }
             }
         }
     }

@@ -1,6 +1,6 @@
 # Realtime Voice Chat
 
-默认模式使用本机 GPU 和 CPU：Android 端采集 PCM 音频，通过 WebSocket 发送到 FastAPI；本机使用 Faster-Whisper 识别、LM Studio 运行本地 LLM、Windows SAPI 合成本地语音。OpenAI 仅作为显式配置时的可选适配器。
+默认模式使用本机 GPU 和 CPU：Android 端采集 PCM 音频，通过 WebSocket 发送到 FastAPI；本机使用 Faster-Whisper 识别、LM Studio 运行本地 LLM，并优先使用 sherpa-onnx 中文神经 TTS（模型未准备好时回退 Windows SAPI）。OpenAI 仅作为显式配置时的可选适配器。
 
 ## 运行服务端
 
@@ -23,6 +23,33 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 后续可以直接执行 `.\start_local.ps1`，自动启动 LM Studio 本地 API、加载模型并启动 FastAPI。
 
+### 本地神经语音
+
+服务端默认会在 `server/models/vits-piper-zh_CN-xiao_ya-medium` 存在时使用
+sherpa-onnx 中文 VITS 音色；模型未准备好或推理失败时自动回退 Windows SAPI。
+首次使用可执行：
+
+```powershell
+cd server
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\setup_neural_tts.ps1
+```
+
+`server/.env` 中可以调整音色参数：
+
+```text
+TTS_ENGINE=auto
+TTS_MODEL_DIR=models/vits-piper-zh_CN-xiao_ya-medium
+TTS_SPEAKER_ID=0
+TTS_SPEED=1.0
+TTS_NUM_THREADS=2
+TTS_PROVIDER=cpu
+```
+
+`TTS_ENGINE=neural` 可强制尝试神经音色，`TTS_ENGINE=sapi` 可临时切回系统语音。
+`/health` 会返回当前模型是否就绪、实际使用的引擎和回退错误；Android 仍接收
+24 kHz 单声道 PCM，音频协议不变。
+
 先在 LM Studio 中启动 Local Server，并加载 `google/gemma-3-12b`（推荐使用 Instruct Q4_K_M 量化）。服务端默认读取 `AI_PROVIDER=lmstudio`，不会调用云端 API。语音识别默认使用 `faster-whisper medium`、CUDA 和 `beam_size=5`，以提升中文识别准确率。
 
 ## Android
@@ -42,7 +69,7 @@ Android 端使用 16kHz、单声道、PCM 16-bit 音频输入和本地 Silero VA
 - 使用 Android 通信音频模式和设备支持的 AEC（回声消除）、NS（降噪）、AGC（自动增益），日志会显示各效果是否启用。参考 [Android AEC 文档](https://developer.android.com/reference/android/media/audiofx/AcousticEchoCanceler)。扬声器大音量、远距离或不支持 AEC 的手机仍需真机调试；必要时使用耳机。
 - 网络收包和音频播放使用独立线程，播放采用非阻塞写入。每个回合有客户端生成的唯一标识，迟到的旧音频、错误和结束事件不会覆盖新回合。
 - `input_audio_buffer.speech_started` 清理旧输入并取消当前回答；`input_audio_buffer.commit` 可携带 `turn_id`；服务端在转写、文本、音频、取消及错误事件中原样返回该标识。短噪声段使用 `input_audio_buffer.clear` 丢弃。
-- 取消会立即停止旧回合输出，但已开始的 Whisper 原生计算和 Windows SAPI 合成不保证被立即终止。Whisper 使用单工作线程串行执行，防止取消后旧计算与新计算争抢 GPU；旧合成结果会被丢弃。
+- 取消会立即停止旧回合输出，但已开始的 Whisper 原生计算和本地 TTS 合成不保证被立即终止。Whisper 使用单工作线程串行执行，防止取消后旧计算与新计算争抢 GPU；旧合成结果会被丢弃。
 - 这是持续收音和可打断的双工交互；本地 ASR 仍在一句话结束后识别，不是逐字流式识别。
 
 服务端回归测试（无需加载模型）：
@@ -139,3 +166,28 @@ OpenAI Realtime 转发模式目前保留原有音频链路，拍照意图应使�
 cd server
 .\.venv\Scripts\python.exe -m unittest -v test_full_duplex.py test_function_call.py
 ```
+
+## 表情词匹配
+
+本地 LM Studio 回复现在可以同时返回正文和一个表情词。服务端把两者拆开，
+正文进入聊天记录和 TTS，Android 使用内置的 60 类表情词库离线匹配，在助手消息
+气泡中显示表情名称。例如 `狂喜、哈哈 → 开心`，`心碎 → 伤心`。
+
+本版采用标准 ID、中文名称、305 个别名和明确歧义规则，不下载额外模型。
+未知或歧义词返回无匹配；尚未训练语义模型，也未绑定图片/动画资源。
+词库的运行时单一来源为
+`server/app/expressions/assets/expressions.v1.json`，Android 构建直接打包同一文件。
+
+`server/.env` 中的 `EXPRESSIONS_ENABLED=true` 默认启用本地回复表情字段；设为
+`false` 可恢复原有纯文本回复协议。OpenAI Realtime 转发模式保持原行为。
+旧模型返回普通文本时也可正常聊天，只是不显示表情。
+
+浏览器打开服务首页，在“表情词匹配”中直接输入词语即可单独验证，无需启动
+Whisper、LM Studio 或 TTS。也可调用：
+
+```text
+GET  /api/expressions
+POST /api/expressions/match   {"word":"狂喜"}
+```
+
+实现说明、事件格式和维护方法见 [表情模块使用说明](docs/expression-mapping/implementation.md)。

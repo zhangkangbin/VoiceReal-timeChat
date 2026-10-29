@@ -1,7 +1,7 @@
 """本地实时语音聊天服务的入口模块。
 
 本模块把 Android 客户端（或测试网页）的 WebSocket 音频流连接到本机的
-Silero/VAD 之后的语音转写、LM Studio 对话模型和 Windows SAPI 语音合成链路。
+Silero/VAD 之后的语音转写、LM Studio 对话模型和本地 TTS 合成链路。
 默认的 `lmstudio` 模式完全在局域网内工作；配置为 `openai` 时，则把事件转发
 给 OpenAI Realtime API。除了 HTTP 健康检查和测试接口外，绝大多数状态都限定在
 单条 WebSocket 会话中，以便不同用户的历史记录、记忆和正在播放的回合互不串扰。
@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import tempfile
+import threading
 import wave
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
@@ -31,8 +32,16 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
 
 from .config import Settings
+from .expressions import (
+    InvalidAssistantReply,
+    expression_prompt,
+    get_expression_catalog,
+    match_expression,
+    parse_assistant_reply,
+)
 from .memory import DEFAULT_USER_ID, MemoryService, memory_service
 from .realtime_session import CameraCaptureError, LocalRealtimeSession
+from .tts import NeuralTts, neural_model_ready
 from .tools import TOOL_DEFINITIONS, execute_tool, realtime_tool_definitions, tool_names
 
 # 从 server/.env（如果存在）读取本地开发配置；显式设置的环境变量仍由 dotenv
@@ -52,12 +61,23 @@ MAX_IMAGE_BYTES = settings.max_image_bytes
 CAMERA_TIMEOUT_SECONDS = settings.camera_timeout_seconds
 NETWORK_TIMEOUT_SECONDS = settings.network_timeout_seconds
 NETWORK_CACHE_SECONDS = settings.network_cache_seconds
+TTS_ENGINE = settings.tts_engine
+TTS_MODEL_DIR = settings.tts_model_dir
+TTS_SPEAKER_ID = settings.tts_speaker_id
+TTS_SPEED = settings.tts_speed
+TTS_NUM_THREADS = settings.tts_num_threads
+TTS_PROVIDER = settings.tts_provider
 FUNCTION_CALLS_ENABLED = settings.function_calls_enabled
 MEMORY_ENABLED = settings.memory_enabled
+EXPRESSIONS_ENABLED = settings.expressions_enabled
 # 当前异步回合的上下文（用户 ID、回合 ID、召回的记忆）。ContextVar 能让并发
 # WebSocket 回合各自看到自己的值，不需要把上下文层层添加到所有函数签名中。
 _turn_context: ContextVar[dict] = ContextVar("turn_context", default={})
 _whisper = None
+_neural_tts: NeuralTts | None = None
+_neural_tts_init_lock = threading.Lock()
+_neural_tts_error: str | None = None
+_neural_tts_error_logged = False
 _cuda_dll_handles = []
 # Cancelling an asyncio task cannot stop a running CTranslate2 call. Keep
 # serialization in the worker, so a cancelled job never overlaps the next one.
@@ -103,7 +123,9 @@ async def health():
     可用工具以及会话历史/记忆等关键开关。
     """
     whisper_engine = getattr(_whisper, "model", None)
-    return {"ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "camera_capture_supported": provider_name() == "lmstudio" and FUNCTION_CALLS_ENABLED, "max_image_bytes": MAX_IMAGE_BYTES, "camera_timeout_seconds": CAMERA_TIMEOUT_SECONDS, "network_timeout_seconds": NETWORK_TIMEOUT_SECONDS, "network_cache_seconds": NETWORK_CACHE_SECONDS, "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE, "max_history_turns": MAX_HISTORY_TURNS, "function_calls_enabled": FUNCTION_CALLS_ENABLED, "memory_enabled": MEMORY_ENABLED, "memory_user_id": DEFAULT_USER_ID, "tools": tool_names(), "whisper_loaded": _whisper is not None, "whisper_device": getattr(whisper_engine, "device", None), "whisper_compute_type": getattr(whisper_engine, "compute_type", None)}
+    tts_ready = neural_model_ready(TTS_MODEL_DIR)
+    tts_active = "neural" if TTS_ENGINE in {"auto", "neural"} and tts_ready and _neural_tts_error is None else "sapi"
+    return {"expression_matching": {"enabled": EXPRESSIONS_ENABLED, "chat_supported": provider_name() == "lmstudio", "matcher": "rules-v1", "catalog_version": get_expression_catalog()["version"], "expression_count": get_expression_catalog()["expression_count"]}, "ok": True, "provider": provider_name(), "lmstudio_url": os.getenv("LMSTUDIO_URL", "http://127.0.0.1:1234/v1"), "lmstudio_model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "camera_capture_supported": provider_name() == "lmstudio" and FUNCTION_CALLS_ENABLED, "max_image_bytes": MAX_IMAGE_BYTES, "camera_timeout_seconds": CAMERA_TIMEOUT_SECONDS, "network_timeout_seconds": NETWORK_TIMEOUT_SECONDS, "network_cache_seconds": NETWORK_CACHE_SECONDS, "tts_engine_requested": TTS_ENGINE, "tts_engine_active": tts_active, "tts_model_dir": TTS_MODEL_DIR, "tts_model_ready": tts_ready, "tts_speaker_id": TTS_SPEAKER_ID, "tts_speed": TTS_SPEED, "tts_error": _neural_tts_error, "whisper_model": WHISPER_MODEL, "whisper_beam_size": WHISPER_BEAM_SIZE, "max_history_turns": MAX_HISTORY_TURNS, "function_calls_enabled": FUNCTION_CALLS_ENABLED, "memory_enabled": MEMORY_ENABLED, "memory_user_id": DEFAULT_USER_ID, "tools": tool_names(), "whisper_loaded": _whisper is not None, "whisper_device": getattr(whisper_engine, "device", None), "whisper_compute_type": getattr(whisper_engine, "compute_type", None)}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -112,14 +134,42 @@ async def test_page():
     return HTMLResponse(TEST_PAGE)
 
 
+@app.get("/api/expressions")
+async def expressions_catalog():
+    """返回与 Android 内置资产共用的表情词库，不触发模型加载。"""
+    return get_expression_catalog()
+
+
+@app.post("/api/expressions/match")
+async def expression_match(payload: dict):
+    """独立测试表情词匹配；不分析原始用户话语，不调用大模型。"""
+    return match_expression(payload.get("word"))
+
+
+def prepare_assistant_reply(raw: str) -> tuple[str, dict]:
+    """将最终模型输出拆为朗读正文和表情元数据，避免元数据进入历史或 TTS。"""
+    if not EXPRESSIONS_ENABLED:
+        return raw, {}
+    try:
+        parsed = parse_assistant_reply(raw)
+        text, word = parsed.text, parsed.expression_word
+    except InvalidAssistantReply:
+        text, word = "抱歉，回复格式异常，请再试一次。", None
+    result = match_expression(word)
+    if word is None:
+        # 没有生成表情是兼容旧模型的正常情况，不是用户提交了错误请求。
+        result = {**result, "status": "NO_MATCH", "reason": "missing_expression"}
+    return text, {"expression_word": word, "expression": result}
+
+
 @app.get("/api/test-default-audio")
 async def test_default_audio():
     """生成一段固定的中文测试语句并以 24 kHz 单声道 WAV 返回。
 
-    合成过程放到线程中，避免 Windows SAPI 的同步调用阻塞 FastAPI 事件循环；返回
+    合成过程放到线程中，避免本地 TTS 的同步推理阻塞 FastAPI 事件循环；返回
     WAV 头则让浏览器可以直接播放，同时仍与客户端发送的 PCM 采样率约定一致。
     """
-    pcm = await asyncio.to_thread(synthesize_sapi, "请介绍一下你自己，并说一句本地测试成功")
+    pcm = await asyncio.to_thread(synthesize_audio, "请介绍一下你自己，并说一句本地测试成功")
     output = io.BytesIO()
     with wave.open(output, "wb") as wav:
         wav.setnchannels(1)
@@ -144,7 +194,8 @@ async def local_chat(payload: dict):
         if MEMORY_ENABLED:
             command = await memory_service.handle_explicit_command(DEFAULT_USER_ID, prompt)
             if command and command.get("handled"):
-                return {"reply": command["reply"]}
+                text, fields = prepare_assistant_reply(str(command["reply"]))
+                return {"reply": text, **fields}
             memories = await memory_service.relevant(DEFAULT_USER_ID, prompt, limit=8)
             token = _turn_context.set({"user_id": DEFAULT_USER_ID, "memory_context": memories})
             try:
@@ -152,8 +203,10 @@ async def local_chat(payload: dict):
             finally:
                 _turn_context.reset(token)
             await memory_service.extract_explicit(DEFAULT_USER_ID, prompt)
-            return {"reply": reply}
-        return {"reply": await ask_lmstudio(prompt)}
+            text, fields = prepare_assistant_reply(reply)
+            return {"reply": text, **fields}
+        text, fields = prepare_assistant_reply(await ask_lmstudio(prompt))
+        return {"reply": text, **fields}
     except httpx.ConnectError:
         from fastapi import HTTPException
         raise HTTPException(status_code=503, detail="LM Studio 本地 API 未启动，请在 LM Studio 中启动 Local Server")
@@ -233,6 +286,8 @@ async def ask_lmstudio(text: str, history: list[dict] | None = None) -> str | Ca
         memory_prompt = MemoryService.prompt_context(turn_context.get("memory_context", []))
         if memory_prompt:
             system_prompt += "\n\n" + memory_prompt
+    if EXPRESSIONS_ENABLED:
+        system_prompt += "\n\n" + expression_prompt()
     messages = [{"role": "system", "content": system_prompt}]
     if history:
         messages.extend(history[-(MAX_HISTORY_TURNS * 2):])
@@ -241,7 +296,7 @@ async def ask_lmstudio(text: str, history: list[dict] | None = None) -> str | Ca
     camera_intent_enabled = bool(turn_context.get("camera_intent_enabled"))
     async with httpx.AsyncClient(timeout=120, trust_env=False) as client:
         for tool_round in range(MAX_TOOL_CALL_ROUNDS + 1):
-            payload = {"model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "messages": messages, "stream": False, "temperature": 0.3, "max_tokens": 128}
+            payload = {"model": os.getenv("LMSTUDIO_MODEL", "google/gemma-3-12b"), "messages": messages, "stream": False, "temperature": 0.3, "max_tokens": 192 if EXPRESSIONS_ENABLED else 128}
             if tools_enabled:
                 available_tools = [
                     tool for tool in TOOL_DEFINITIONS
@@ -314,7 +369,7 @@ async def analyze_image(prompt: str, image: bytes, mime_type: str = "image/jpeg"
         "messages": [
             {
                 "role": "system",
-                "content": "你是一个中文视觉助手。请根据照片回答用户的问题，先说明看见的主要物体、人物、文字和环境，再补充与问题相关的细节。只输出适合直接朗读的简洁中文，不要使用 Markdown；看不清时明确说明。",
+                "content": "你是一个中文视觉助手。请根据照片回答用户的问题，先说明看见的主要物体、人物、文字和环境，再补充与问题相关的细节。回答正文使用适合直接朗读的简洁中文，不要使用 Markdown；看不清时明确说明。" + ("\n\n" + expression_prompt() if EXPRESSIONS_ENABLED else ""),
             },
             {
                 "role": "user",
@@ -365,6 +420,47 @@ def synthesize_sapi(text: str) -> bytes:
         if rate != 24000:
             frames, _ = audioop.ratecv(frames, width, channels, rate, 24000, None)
         return frames
+
+
+def _get_neural_tts() -> NeuralTts:
+    """惰性创建神经 TTS；模型只在第一次真正需要合成时加载。"""
+    global _neural_tts
+    if _neural_tts is None:
+        with _neural_tts_init_lock:
+            if _neural_tts is None:
+                _neural_tts = NeuralTts(
+                    TTS_MODEL_DIR,
+                    speaker_id=TTS_SPEAKER_ID,
+                    speed=TTS_SPEED,
+                    num_threads=TTS_NUM_THREADS,
+                    provider=TTS_PROVIDER,
+                )
+    return _neural_tts
+
+
+def synthesize_audio(text: str) -> bytes:
+    """根据配置选择本地神经 TTS，并在不可用时回退到 Windows SAPI。
+
+    ``auto`` 在模型文件齐全时使用神经音色；模型未下载、依赖未安装或推理
+    失败时都回退 SAPI，避免因为音色模型问题让整个语音会话不可用。显式设置
+    ``neural`` 也保留同样的回退策略，但会把故障写入 health 状态和服务日志。
+    """
+    global _neural_tts_error, _neural_tts_error_logged
+    wants_neural = TTS_ENGINE in {"auto", "neural"}
+    if wants_neural and _neural_tts_error is None and neural_model_ready(TTS_MODEL_DIR):
+        try:
+            return _get_neural_tts().synthesize(text)
+        except Exception as error:
+            _neural_tts_error = f"{type(error).__name__}: {error}"
+            if not _neural_tts_error_logged:
+                print(f"Neural TTS unavailable; falling back to Windows SAPI: {_neural_tts_error}", flush=True)
+                _neural_tts_error_logged = True
+    elif TTS_ENGINE == "neural":
+        _neural_tts_error = f"神经 TTS 模型不存在：{TTS_MODEL_DIR}"
+        if not _neural_tts_error_logged:
+            print(f"Neural TTS model is not ready; falling back to Windows SAPI: {TTS_MODEL_DIR}", flush=True)
+            _neural_tts_error_logged = True
+    return synthesize_sapi(text)
 
 
 async def send_event(websocket: WebSocket, send_lock: asyncio.Lock, payload: dict):
@@ -425,11 +521,12 @@ async def local_turn(websocket: WebSocket, send_lock: asyncio.Lock, pcm: bytes, 
                     reply = error.user_message
             if MEMORY_ENABLED:
                 await memory_service.extract_explicit(user_id, text, turn_id)
+        reply, expression_fields = prepare_assistant_reply(reply)
         history.extend([{"role": "user", "content": text}, {"role": "assistant", "content": reply}])
         del history[:-(MAX_HISTORY_TURNS * 2)]
         print(f"local turn llm done ({time.perf_counter() - started:.2f}s)", flush=True)
-        await send_event(websocket, send_lock, {"type": "response.text.done", "turn_id": turn_id, "text": reply, "final": True})
-        audio = await asyncio.to_thread(synthesize_sapi, reply)
+        await send_event(websocket, send_lock, {"type": "response.text.done", "turn_id": turn_id, "text": reply, "final": True, **expression_fields})
+        audio = await asyncio.to_thread(synthesize_audio, reply)
         print(f"local turn tts done: {len(audio)} bytes ({time.perf_counter() - started:.2f}s)", flush=True)
         for offset in range(0, len(audio), 4800):
             chunk = base64.b64encode(audio[offset:offset + 4800]).decode()
